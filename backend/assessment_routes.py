@@ -1,10 +1,22 @@
 from fastapi import APIRouter, HTTPException
+from bson import ObjectId
 from database import db
 from domain import AI_CATEGORIES, DEFAULT_WEIGHTS, PROFILE_CATEGORIES, ScoreWeights, audit, duration_months, identifier, normalized, utcnow
 from enterprise_evaluation import (DECISIONS, DEFAULT_BANDS, evaluate_eligibility, normalized_stage,
                                    pending_decision, profile_totals, recommendation, score_interview)
 
-def clean(value): return {k: v for k, v in value.items() if k != "_id"} if value else None
+
+def clean(value):
+    """Recursively remove Mongo internals and serialize ObjectIds for API responses."""
+    if value is None:
+        return None
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: clean(item) for key, item in value.items() if key != "_id"}
+    if isinstance(value, (list, tuple)):
+        return [clean(item) for item in value]
+    return value
 
 def deduplicated(records, key_fields):
     """Return one UI record per normalized identity while preserving every source."""
@@ -48,14 +60,17 @@ def build_assessment_router(require_session):
     @router.get("/candidates/me/structured")
     def structured_profile(token: str):
         user = require_session(token); cid = user["id"]
+        cand = clean(db.candidates.find_one({"id": cid})) or clean(db.candidates.find_one({"user_id": cid})) or {}
+        raw_skills = cand.get("skills") or []
+        skills_formatted = [{"skill": s, "normalized_skill": str(s).lower()} if isinstance(s, str) else s for s in raw_skills]
         return {
-            "candidate": clean(db.candidates.find_one({"id": cid})),
-            "skills": deduplicated(db.candidate_skills.find({"candidate_id": cid}), ("normalized_skill", "kind")),
-            "experience": deduplicated(db.candidate_experience.find({"candidate_id": cid}), ("company", "position", "start_date")),
-            "projects": deduplicated(db.candidate_projects.find({"candidate_id": cid}), ("name",)),
-            "education": deduplicated(db.candidate_education.find({"candidate_id": cid}), ("qualification", "institution", "field")),
-            "certifications": deduplicated(db.candidate_certifications.find({"candidate_id": cid}), ("name", "issuer")),
-            "languages": deduplicated(db.candidate_languages.find({"candidate_id": cid}), ("language",)),
+            "candidate": cand,
+            "skills": skills_formatted,
+            "experience": cand.get("experience") or [],
+            "projects": cand.get("projects") or [],
+            "education": cand.get("education") or [],
+            "certifications": cand.get("certifications") or [],
+            "languages": cand.get("languages") or [],
             "cv_analyses": [clean(x) for x in db.cv_documents.find({"candidate_id": cid}, {"_id": 0, "content": 0, "raw_gemini_result": 0}).sort("uploaded_at", -1)],
             "github": clean(db.candidate_github.find_one({"candidate_id": cid})),
             "linkedin": clean(db.linkedin_evidence_snapshots.find_one({"candidate_id": cid}, sort=[("verified_at", -1)])),
@@ -88,11 +103,17 @@ def build_assessment_router(require_session):
         allowed = {
             "experience": {"company", "position", "start_date", "end_date", "is_current", "responsibilities", "technologies", "achievements", "location", "employment_type"},
             "education": {"qualification", "degree", "field", "institution", "start_year", "end_year", "grade", "final_year_project"},
-            "projects": {"name", "description", "candidate_contribution", "technologies", "github_url", "demo_url", "project_type", "achievements"},
-            "certifications": {"name", "issuer", "issue_date", "expiry_date", "credential_url", "credential_id"},
+            "projects": {"name", "description", "candidate_contribution", "technologies", "soft_skills", "github_url", "demo_url", "project_type", "achievements"},
+            "certifications": {"name", "issuer", "description", "issue_date", "expiry_date", "credential_url", "credential_id", "relevant_skills"},
             "languages": {"language", "speaking_level", "reading_level", "writing_level", "level", "evidence"},
         }[section]
         item = {key: value for key, value in payload.items() if key in allowed}
+        if section == "projects" and isinstance(item.get("soft_skills"), str):
+            item["soft_skills"] = [part.strip() for part in item["soft_skills"].split(",") if part.strip()]
+        if section == "projects" and isinstance(item.get("technologies"), str):
+            item["technologies"] = [part.strip() for part in item["technologies"].split(",") if part.strip()]
+        if section == "certifications" and isinstance(item.get("relevant_skills"), str):
+            item["relevant_skills"] = [part.strip() for part in item["relevant_skills"].split(",") if part.strip()]
         if section == "languages":
             supported_languages = {"english", "sinhala", "tamil"}
             proficiency_levels = {"basic", "moderate", "fluent"}

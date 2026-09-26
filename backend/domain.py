@@ -1,9 +1,19 @@
+# =========================================================================================
+# FILE: domain.py
+# PURPOSE: Pydantic domain schemas and business validation rules.
+#          CRITICAL SECURITY ARCHITECTURE: Gemini AI outputs are NEVER written directly to MongoDB.
+#          All raw AI JSON is passed through these strict Pydantic models (StrictModel) to enforce
+#          type safety, sanitize inputs, reject unexpected fields, and compute derived metrics.
+# =========================================================================================
+
 """Validated recruitment domain records; Gemini never writes to MongoDB directly."""
 
 import uuid
 from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+
+from cv_normalization import calculate_duration_months, calculate_merged_experience_years, is_soft_skill_candidate, canonicalize_skill_name
 
 PROFILE_CATEGORIES = ("technical_skills", "experience", "projects", "education", "certifications", "github_evidence", "job_relevance")
 CATEGORIES = (*PROFILE_CATEGORIES, "technical_assessment", "structured_interview")
@@ -13,6 +23,12 @@ DEFAULT_WEIGHTS = {"technical_skills": 20, "experience": 15, "projects": 10, "ed
                    "technical_assessment": 15, "structured_interview": 15}
 
 
+# -----------------------------------------------------------------------------------------
+# STEP 1: STRICT BASE MODEL
+# WHY THIS STEP:
+# - extra="forbid" rejects any unexpected/hallucinated JSON keys returned by LLMs.
+# - str_strip_whitespace=True trims leading/trailing whitespace automatically.
+# -----------------------------------------------------------------------------------------
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -23,6 +39,9 @@ class PersonalInfo(StrictModel):
     phone: str | None = None
     location: str | None = None
     professional_title: str | None = None
+    headline: str | None = None
+    bio: str | None = None
+    experience_years: float | None = None
     linkedin_url: HttpUrl | None = None
     portfolio_url: HttpUrl | None = None
 
@@ -44,11 +63,15 @@ class SoftSkill(StrictModel):
 class Experience(StrictModel):
     company: str | None = None
     position: str | None = None
+    role: str | None = None
     start_date: str | None = None
     end_date: str | None = None
     is_current: bool = False
+    duration_months: int | None = None
+    description: str | None = None
     responsibilities: list[str] = Field(default_factory=list)
     technologies: list[str] = Field(default_factory=list)
+    skills_used: list[str] = Field(default_factory=list)
     achievements: list[str] = Field(default_factory=list)
     employment_type: str | None = None
     location: str | None = None
@@ -59,6 +82,7 @@ class Project(StrictModel):
     name: str
     description: str | None = None
     technologies: list[str] = Field(default_factory=list)
+    soft_skills: list[str] = Field(default_factory=list)
     github_url: HttpUrl | None = None
     demo_url: HttpUrl | None = None
     candidate_contribution: str | None = None
@@ -82,11 +106,14 @@ class Education(StrictModel):
 class Certification(StrictModel):
     name: str
     issuer: str | None = None
+    description: str | None = None
     issue_date: str | None = None
     expiry_date: str | None = None
-    credential_url: HttpUrl | None = None
+    credential_url: str | None = None
     credential_id: str | None = None
+    relevant_skills: list[str] = Field(default_factory=list)
     confidence: float = Field(default=.5, ge=0, le=1)
+
 
 
 class Github(StrictModel):
@@ -153,6 +180,8 @@ class Language(StrictModel):
 
 class CvExtraction(StrictModel):
     personal_info: PersonalInfo = Field(default_factory=PersonalInfo)
+    professional_summary: str | None = None
+    programming_languages: list[str] = Field(default_factory=list)
     technical_skills: list[TechnicalSkill] = Field(default_factory=list)
     soft_skills: list[SoftSkill] = Field(default_factory=list)
     experience: list[Experience] = Field(default_factory=list)
@@ -161,6 +190,8 @@ class CvExtraction(StrictModel):
     certifications: list[Certification] = Field(default_factory=list)
     github: Github = Field(default_factory=Github)
     languages: list[Language] = Field(default_factory=list)
+    human_languages: list[Language] = Field(default_factory=list)
+    social_links: dict = Field(default_factory=dict)
 
 
 class ScoreWeights(StrictModel):
@@ -230,20 +261,57 @@ def audit(db, action, actor_id, entity_type, entity_id, details=None):
         "entity_type": entity_type, "entity_id": entity_id, "details": details or {}, "created_at": utcnow()})
 
 def duration_months(start, end, current=False):
-    if not start: return None
-    try:
-        start_date = datetime.strptime(start[:7], "%Y-%m")
-        end_date = utcnow() if current or not end else datetime.strptime(end[:7], "%Y-%m").replace(tzinfo=timezone.utc)
-        if start_date.tzinfo is None: start_date = start_date.replace(tzinfo=timezone.utc)
-        return max(0, (end_date.year - start_date.year) * 12 + end_date.month - start_date.month)
-    except (TypeError, ValueError): return None
+    return calculate_duration_months(start, end, is_current=current)
+
+
+def enriched_technical_skills(data):
+    """Merge direct, project, and certification skills without losing their evidence."""
+    merged = {}
+
+    def add(skill, source, evidence):
+        raw_val = skill.get("skill") if isinstance(skill, dict) else skill
+        label = canonicalize_skill_name(raw_val) or " ".join(str(raw_val or "").strip().split())
+        key = normalized(label)
+        if not key:
+            return
+        item = merged.setdefault(key, {"skill": label, "category": None, "source": source,
+                                      "evidence": [], "confidence": 0.75})
+        item["confidence"] = max(item["confidence"], 0.9 if source == "cv" else 0.8)
+        if evidence and evidence not in item["evidence"]:
+            item["evidence"].append(evidence)
+
+    for item in data.get("technical_skills") or []:
+        add(item, "cv", None)
+        raw_val = item.get("skill") if isinstance(item, dict) else item
+        label = canonicalize_skill_name(raw_val) or " ".join(str(raw_val or "").strip().split())
+        current = merged.get(normalized(label))
+        if current and isinstance(item, dict):
+            current.update({key: value for key, value in item.items() if key != "evidence"})
+            current["skill"] = label
+            current["evidence"] = list(dict.fromkeys([*current["evidence"], *(item.get("evidence") or [])]))
+    for project in data.get("projects") or []:
+        for skill in project.get("technologies") or []:
+            add(skill, "cv_project", f"Project: {project.get('name') or 'Unnamed project'}")
+    for certification in data.get("certifications") or []:
+        for skill in certification.get("relevant_skills") or []:
+            add(skill, "cv_certification", f"Certification: {certification.get('name') or 'Unnamed certification'}")
+    return list(merged.values())
 
 
 def save_extraction(db, candidate_id, extraction, document_id, file_name, model_name):
     data = extraction.model_dump(mode="json"); stamp = utcnow()
-    tech_skills = [item["skill"] for item in data.get("technical_skills", []) if item.get("skill")]
-    soft_skills = [item["skill"] for item in data.get("soft_skills", []) if item.get("skill")]
-    all_skills = list(dict.fromkeys(tech_skills + soft_skills))
+    data["technical_skills"] = enriched_technical_skills(data)
+    tech_skills = [item["skill"] for item in data["technical_skills"]]
+    project_soft_skills = []
+    for project in data.get("projects") or []:
+        for skill in project.get("soft_skills") or []:
+            label = " ".join(str(skill or "").split())
+            if label and is_soft_skill_candidate(label):
+                project_soft_skills.append(label)
+    soft_skills = [(item["skill"] if isinstance(item, dict) else str(item)) for item in (data.get("soft_skills") or []) if (item.get("skill") if isinstance(item, dict) else str(item).strip())]
+    soft_skills = [s for s in soft_skills if is_soft_skill_candidate(s)]
+    all_soft_skills = list(dict.fromkeys([*soft_skills, *project_soft_skills]))
+    all_skills = list(dict.fromkeys(tech_skills + all_soft_skills))
 
     personal_info = data.get("personal_info", {})
     social_links = {
@@ -254,7 +322,7 @@ def save_extraction(db, candidate_id, extraction, document_id, file_name, model_
 
     skills_summary = {
         "technical_skills": tech_skills,
-        "soft_skills": soft_skills,
+        "soft_skills": all_soft_skills,
         "all_skills": all_skills,
     }
 
@@ -282,6 +350,49 @@ def save_extraction(db, candidate_id, extraction, document_id, file_name, model_
         },
         upsert=True,
     )
+    profile_fields = {
+        "personal_info": personal_info,
+        "social_links": social_links,
+        "technical_skills": tech_skills,
+        "soft_skills": all_soft_skills,
+        "projects": data.get("projects") or [],
+        "education": data.get("education") or [],
+        "certifications": data.get("certifications") or [],
+        "updated_at": stamp,
+    }
+    db.candidate_profiles.update_one(
+        {"id": candidate_id},
+        {"$set": {"id": candidate_id, "user_id": candidate_id, **profile_fields},
+         "$setOnInsert": {"created_at": stamp}},
+        upsert=True,
+    )
+    user_fields = {
+        "cvFileName": file_name,
+        "cvImportedAt": stamp,
+        "updatedAt": stamp,
+        "technicalSkills": ", ".join(tech_skills),
+        "softSkills": ", ".join(all_soft_skills),
+        "skills": ", ".join(all_skills),
+    }
+    if personal_info.get("full_name"): user_fields["name"] = personal_info["full_name"]
+    headline_val = personal_info.get("headline") or personal_info.get("professional_title")
+    if headline_val: user_fields["headline"] = headline_val
+    if personal_info.get("location"): user_fields["location"] = personal_info["location"]
+    if personal_info.get("phone"): user_fields["phone"] = personal_info["phone"]
+    bio_val = personal_info.get("bio") or data.get("professional_summary")
+    if bio_val: user_fields["bio"] = bio_val
+    merged_exp_years = calculate_merged_experience_years(data.get("experience") or [])
+    if merged_exp_years > 0:
+        user_fields["experience"] = merged_exp_years
+    elif personal_info.get("experience_years") is not None:
+        user_fields["experience"] = round(safe_float(personal_info["experience_years"]), 1)
+    else:
+        user_fields["experience"] = 0.0
+
+    if social_links.get("linkedin_url"): user_fields["linkedinUrl"] = social_links["linkedin_url"]
+    if social_links.get("github_url"): user_fields["githubUrl"] = social_links["github_url"]
+    if social_links.get("portfolio_url"): user_fields["portfolioUrl"] = social_links["portfolio_url"]
+    db.users.update_one({"id": candidate_id}, {"$set": user_fields})
 
     for kind, items in (("technical", data["technical_skills"]), ("soft", data["soft_skills"])):
         for item in items:
@@ -302,6 +413,15 @@ def save_extraction(db, candidate_id, extraction, document_id, file_name, model_
                 "education": ("qualification", "institution", "field"), "certifications": ("name", "issuer")}[field]
         unique = {}
         for item in data[field]:
+            # Discard empty cards
+            if field == "experience" and not item.get("company") and not item.get("position"):
+                continue
+            if field == "projects" and not item.get("name"):
+                continue
+            if field == "education" and not item.get("qualification") and not item.get("institution"):
+                continue
+            if field == "certifications" and not item.get("name"):
+                continue
             key = "|".join(normalized(item.get(part)) for part in keys)
             if key.strip("|") and key not in unique: unique[key] = item
         records = [{**item, **{f"normalized_{part}": normalized(item.get(part)) for part in keys}, "id": identifier(), "candidate_id": candidate_id, "source": "cv_gemini",
@@ -314,7 +434,7 @@ def save_extraction(db, candidate_id, extraction, document_id, file_name, model_
         "reading_level": language_proficiency(item.get("reading_level") or item.get("level")),
         "writing_level": language_proficiency(item.get("writing_level") or item.get("level")),
         "normalized_language": key, "id": identifier(), "candidate_id": candidate_id, "source": "cv_gemini"}
-        for key, item in unique_languages.items()]
+        for key, item in unique_languages.items() if key]
     if languages: db.candidate_languages.insert_many(languages)
     github = data["github"]
     existing_github = db.candidate_github.find_one({"candidate_id": candidate_id}) or {}
@@ -327,6 +447,78 @@ def save_extraction(db, candidate_id, extraction, document_id, file_name, model_
             "verification_status": "not_verified", "analysis": {"repository_count": None, "selected_repositories": [],
             "main_languages": [], "candidate_commits_sampled": None, "code_quality_score": None}}}, upsert=True)
     audit(db, "cv_extraction_saved", candidate_id, "candidate", candidate_id, {"document_id": document_id})
+
+
+def reset_candidate_profile(db, candidate_id: str):
+    """Reset the candidate-owned profile data without deleting the candidate account itself."""
+    if not candidate_id:
+        raise ValueError("candidate_id is required")
+
+    candidate_filters = {"candidate_id": candidate_id}
+    for collection_name in (
+        "candidate_skills",
+        "candidate_experience",
+        "candidate_education",
+        "candidate_projects",
+        "candidate_certifications",
+        "candidate_languages",
+        "cv_documents",
+        "candidate_github",
+        "github_evidence_snapshots",
+        "linkedin_evidence_snapshots",
+        "portfolio_evidence_snapshots",
+    ):
+        collection = getattr(db, collection_name, None)
+        if collection is not None and hasattr(collection, "delete_many"):
+            collection.delete_many(candidate_filters if collection_name not in {"analysis_runs", "candidate_scores", "candidate_job_matches"} else {"candidate_id": candidate_id})
+
+    for collection_name in ("analysis_runs", "candidate_scores", "candidate_job_matches"):
+        collection = getattr(db, collection_name, None)
+        if collection is not None and hasattr(collection, "delete_many"):
+            collection.delete_many({"candidate_id": candidate_id})
+
+    candidate_profile_collection = getattr(db, "candidate_profiles", None)
+    if candidate_profile_collection is not None and hasattr(candidate_profile_collection, "delete_many"):
+        candidate_profile_collection.delete_many({"id": candidate_id, "user_id": candidate_id})
+
+    candidate_collection = getattr(db, "candidates", None)
+    if candidate_collection is not None and hasattr(candidate_collection, "delete_many"):
+        candidate_collection.delete_many({"id": candidate_id, "user_id": candidate_id})
+
+    user_collection = getattr(db, "users", None)
+    if user_collection is not None and hasattr(user_collection, "update_one"):
+        user_collection.update_one(
+            {"id": candidate_id},
+            {"$set": {
+                "technicalSkills": "",
+                "softSkills": "",
+                "skills": "",
+                "headline": "",
+                "phone": "",
+                "location": "",
+                "bio": "",
+                "experience": "",
+                "company": "",
+                "githubUrl": "",
+                "linkedinUrl": "",
+                "portfolioUrl": "",
+                "cvFileName": "",
+                "cvImportedAt": "",
+                "linkedinVerification": None,
+                "portfolioVerification": None,
+                "profilePhotoUrl": "",
+                "photoVisibleToRecruiters": False,
+                "updatedAt": utcnow(),
+            }}
+        )
+    return {"ok": True, "candidate_id": candidate_id}
+
+
+def safe_float(val, default=0.0):
+    try:
+        return float(val) if val is not None and str(val).strip() != "" else default
+    except (ValueError, TypeError):
+        return default
 
 
 def save_manual_profile(db, user, changes):
@@ -344,7 +536,7 @@ def save_manual_profile(db, user, changes):
             "headline": changes.get("headline", user.get("headline")),
             "company": changes.get("company", user.get("company")),
             "bio": changes.get("bio", user.get("bio")),
-            "experience_years": float(changes.get("experience", user.get("experience") or 0)),
+            "experience_years": safe_float(changes.get("experience", user.get("experience"))),
         }
         social_links = {
             "linkedin_url": changes.get("linkedinUrl", user.get("linkedinUrl")),

@@ -3,12 +3,36 @@
 import json
 import os
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
 class LinkedInVerificationError(Exception):
     pass
+
+
+def normalize_profile_url(value):
+    """Return a canonical public LinkedIn member URL, or None for non-profile links."""
+    value = str(value or "").strip().replace("\\.", ".").rstrip(".,;:")
+    if not value:
+        return None
+    if "://" not in value:
+        value = f"https://{value.lstrip('/')}"
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").casefold()
+        parts = [part for part in parsed.path.split("/") if part]
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or host not in {"linkedin.com", "www.linkedin.com"}
+            or len(parts) != 2
+            or parts[0].casefold() != "in"
+            or not parts[1].strip()
+        ):
+            return None
+        return f"https://www.linkedin.com/in/{parts[1]}"
+    except ValueError:
+        return None
 
 
 def configuration():

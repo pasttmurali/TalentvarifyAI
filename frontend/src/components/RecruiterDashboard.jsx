@@ -1,3 +1,9 @@
+// =========================================================================================
+// FILE: RecruiterDashboard.jsx
+// PURPOSE: Recruiter portal for posting jobs, customizing 9-dimension scoring weights,
+//          evaluating candidates with AI, reviewing GitHub/code evidence, and hiring decisions.
+// =========================================================================================
+
 import React, { useEffect, useState } from 'react';
 import {
   AlertCircle,
@@ -34,6 +40,14 @@ import {
 } from 'lucide-react';
 import { apiRequest } from '../services/api';
 
+// -----------------------------------------------------------------------------------------
+// STEP 1: SCORING WEIGHTS CONFIGURATION (9 EVALUATION DIMENSIONS)
+// WHY THIS STEP:
+// - TalentVerifyAI evaluates candidates across 9 balanced dimensions.
+// - Recruiters can tune these percentage weights per job (e.g. emphasize GitHub evidence
+//   for senior engineering roles, or communication for managerial roles).
+// - Total must sum to 100% for mathematical consistency.
+// -----------------------------------------------------------------------------------------
 const DEFAULT_WEIGHTS = {
   technical_skills: 20,
   experience: 15,
@@ -420,6 +434,19 @@ export default function RecruiterDashboard({
                               </a>
                             </p>
                           )}
+                          {profile.linkedinUrl && (
+                            <p className="mb-2 text-sm text-slate-600">
+                              <span className="font-semibold text-slate-800">LinkedIn:</span>{' '}
+                              <a
+                                href={profile.linkedinUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 break-all font-semibold text-blue-700 hover:underline"
+                              >
+                                View LinkedIn profile <ExternalLink size={13} />
+                              </a>
+                            </p>
+                          )}
                           {application.github_snapshot_id && (
                             <Detail label="GitHub Snapshot" value={application.github_snapshot_id} />
                           )}
@@ -507,6 +534,8 @@ export default function RecruiterDashboard({
                           {analysis.ai_suggestion || 'No AI guidance was saved for this application.'}
                         </p>
                       </div>
+
+                      <RecruiterMarkingBreakdown application={application} analysis={analysis} />
 
                       {/* Deep GitHub Evidence Section */}
                       {githubEvidence && (
@@ -1310,6 +1339,83 @@ function DetailedGithubEvidenceSection({
       )}
     </section>
   );
+}
+
+const MARKING_LABELS = {
+  technical_skills: 'Role-specific skills',
+  relevant_experience: 'Relevant experience',
+  experience: 'Experience',
+  projects: 'Projects / initiatives',
+  github_evidence: 'GitHub evidence',
+  github: 'GitHub evidence',
+  education: 'Education',
+  soft_skills: 'Soft skills',
+  languages: 'Languages',
+  professional_alignment: 'Professional alignment',
+  certifications: 'Certifications',
+  job_relevance: 'Job relevance',
+};
+
+function RecruiterMarkingBreakdown({ application, analysis = {} }) {
+  const primary = analysis.score_breakdown || application.jobMatchScoreBreakdown || {};
+  const scoringRecords = application.scores || {};
+  const categories = Object.entries(Object.keys(primary).length ? primary : scoringRecords);
+
+  if (!categories.length) {
+    return <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+      <h4 className="text-sm font-bold text-slate-900">Detailed marking breakdown</h4>
+      <p className="mt-2 text-sm text-slate-500">No category snapshot was saved for this earlier evaluation.</p>
+    </section>;
+  }
+
+  return <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+    <div className="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h4 className="text-sm font-bold text-slate-900">Detailed marking breakdown</h4>
+        <p className="mt-1 text-xs text-slate-500">Saved marks, calculation, rationale, and evidence for each evaluated part.</p>
+      </div>
+      <span className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-extrabold text-white">
+        {application.overallScore ?? application.score ?? analysis.candidate_score ?? 0}/100 final
+      </span>
+    </div>
+    <div className="mt-4 grid items-start gap-3 md:grid-cols-2">
+      {categories.map(([category, item]) => (
+        <RecruiterMarkingCard
+          key={category}
+          category={category}
+          item={{ ...(scoringRecords[category] || {}), ...(item || {}) }}
+          evidenceConfidence={analysis.evidence_confidence ?? application.evidenceConfidence}
+        />
+      ))}
+    </div>
+  </section>;
+}
+
+function RecruiterMarkingCard({ category, item = {}, evidenceConfidence }) {
+  const [expanded, setExpanded] = useState(false);
+  const score = Number(item.score ?? item.weighted_score ?? 0);
+  const maximum = Number(item.max ?? item.max_score ?? item.maximum_score ?? 0);
+  const percentage = maximum > 0 ? Math.round((score / maximum) * 1000) / 10 : 0;
+  const evidence = Array.isArray(item.evidence) ? item.evidence.filter(Boolean) : [];
+  const label = MARKING_LABELS[category] || category.replaceAll('_', ' ');
+
+  return <article className="rounded-lg border border-slate-200 bg-slate-50/70 p-4">
+    <div className="flex items-center justify-between gap-3">
+      <span className="text-xs font-bold capitalize text-slate-800">{label}</span>
+      <span className="text-sm font-extrabold tabular-nums text-blue-700">{score}/{maximum}</span>
+    </div>
+    <p className="mt-2 text-xs leading-5 text-slate-600">{item.reason || 'No scoring rationale was recorded.'}</p>
+    <button type="button" onClick={() => setExpanded((value) => !value)} className="mt-2 text-xs font-bold text-blue-700 hover:underline">
+      {expanded ? 'Hide marking steps' : 'View marking steps'}
+    </button>
+    {expanded && <div className="mt-3 space-y-2 rounded-lg border border-blue-100 bg-white p-3 text-xs leading-5 text-slate-700">
+      <p><strong>Calculation:</strong> {score} awarded / {maximum} maximum x 100 = <strong>{percentage}%</strong> category achievement.</p>
+      <p><strong>Final-score contribution:</strong> This category contributes {score} of its available {maximum} marks.</p>
+      <p><strong>Assessment:</strong> {item.reason || 'No scoring rationale was recorded.'}</p>
+      {evidenceConfidence != null && <p><strong>Evidence confidence:</strong> {evidenceConfidence}% (reported separately from marks).</p>}
+      {evidence.length ? <div><strong>Evidence used:</strong><ul className="mt-1 list-disc pl-5">{evidence.map((value, index) => <li key={index}>{typeof value === 'string' ? value : JSON.stringify(value)}</li>)}</ul></div> : <p><strong>Evidence:</strong> The saved assessment reason records the evidence basis for this category.</p>}
+    </div>}
+  </article>;
 }
 
 function MetricCard({ label, value, icon }) {

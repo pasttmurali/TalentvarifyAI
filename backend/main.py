@@ -23,11 +23,16 @@ import json
 import io
 import asyncio
 import re
-from pypdf import PdfReader
-from docx import Document
 from dotenv import load_dotenv
 from database import connect_database, db
-from domain import AiEvaluation, CvExtraction, DEFAULT_WEIGHTS, ScoreWeights, audit, identifier, legacy_evaluation, save_extraction, save_manual_profile, utcnow, weighted_evaluation
+from cv_document import extract_cv_content, find_github_profile_url, find_linkedin_profile_url, infer_cv_sections_from_text
+from cv_normalization import (
+    EXTRACTION_SCHEMA_JSON,
+    SYSTEM_EXTRACTION_INSTRUCTION,
+    is_soft_skill_candidate,
+    normalize_cv_extraction,
+)
+from domain import AiEvaluation, CvExtraction, DEFAULT_WEIGHTS, ScoreWeights, audit, enriched_technical_skills, identifier, legacy_evaluation, reset_candidate_profile, save_extraction, save_manual_profile, utcnow, weighted_evaluation
 from enterprise_evaluation import DEFAULT_BANDS, build_profile_scores, pending_decision, profile_totals, validate_bands, validate_requirements
 from github_evidence import (
     GithubVerificationError,
@@ -38,7 +43,7 @@ from github_evidence import (
     github_skill_records,
     verify_github_profile,
 )
-from linkedin_evidence import LinkedInVerificationError, authorization_url, configuration as linkedin_configuration, exchange_and_collect, evidence_summary
+from linkedin_evidence import LinkedInVerificationError, authorization_url, configuration as linkedin_configuration, evidence_summary, exchange_and_collect, normalize_profile_url
 from portfolio_evidence import PortfolioVerificationError, verify_portfolio
 from gemini_rest import generate_json as generate_gemini_json
 
@@ -51,34 +56,62 @@ from services.github_service import GithubService
 from services.scoring_service import ScoringService
 from services.cv_analysis_service import CvAnalysisService
 from services.job_match_service import JobMatchService
-from services.enterprise_job_evaluation_service import evaluate as evaluate_enterprise_job, enterprise_scores
+from services.enterprise_job_evaluation_service import SCORING_RULES_VERSION, evaluate as evaluate_enterprise_job, enterprise_scores
 from services.candidate_service import CandidateService
 
+# ==============================================================================
+# STEP 1: Load Environment Variables & Secrets
+# WHY THIS STEP: Keeps confidential credentials (like GEMINI_API_KEY) out of source code.
+# ==============================================================================
 load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / "CV" / ".env")
 
 api_key = os.environ.get("GEMINI_API_KEY", "")
 model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite") if api_key else None
 
+# ==============================================================================
+# STEP 2: Initialize Data Access Repositories (Tier 4)
+# WHY THIS STEP: Provides clean CRUD interfaces for MongoDB collections.
+# ==============================================================================
 candidate_repo = CandidateRepository(db)
 github_repo = GithubRepository(db)
 analysis_repo = AnalysisRepository(db)
 job_repo = JobRepository(db)
 
+# ==============================================================================
+# STEP 3: Initialize Domain Services & AI Engines (Tier 3)
+# WHY THIS STEP: Encapsulates CV analysis, GitHub verification, and match calculations.
+# ==============================================================================
 github_service = GithubService(github_repo, api_key=api_key, model_name=model or "gemini-3.5-flash-lite")
 scoring_service = ScoringService()
 cv_analysis_service = CvAnalysisService(candidate_repo, analysis_repo, github_service, api_key=api_key, model_name=model or "gemini-3.5-flash-lite")
 job_match_service = JobMatchService()
 candidate_service = CandidateService(candidate_repo, analysis_repo, github_repo)
 
-app = FastAPI()
+# ==============================================================================
+# STEP 4: Create FastAPI Application & Static File Directory
+# WHY THIS STEP: 'app' is the central ASGI application instance handling incoming HTTP requests.
+# ==============================================================================
+app = FastAPI(title="TalentVerifyAI API", version="1.0.0")
+
+# Mount '/uploads' to serve uploaded files (e.g. candidate profile pictures)
 UPLOADS_DIR = Path(__file__).resolve().parent / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
+# ==============================================================================
+# STEP 5: Configure Security & Performance Middleware
+# ==============================================================================
+# Parse allowed CORS origins so React on port 5173 can communicate with FastAPI on port 8000
 cors_origins = [origin.strip() for origin in os.getenv(
     "CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173"
 ).split(",") if origin.strip()]
 
+from fastapi.middleware.gzip import GZipMiddleware
+
+# WHY THIS STEP: CORSMiddleware allows browsers to make cross-origin requests safely
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -86,6 +119,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# WHY THIS STEP: GZipMiddleware compresses response payloads larger than 1KB by up to 80%,
+# significantly speeding up network response times on the frontend!
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 DEMO_RECRUITER = {"id": "demo-recruiter-1", "role": "recruiter", "name": "Demo Recruiter", "email": "recruiter@gmail.com", "company": "TalentVerify Technologies", "location": "Colombo, Sri Lanka", "bio": "Hiring talented people for growing technology teams."}
 DEMO_CANDIDATE = {"id": "demo-candidate-1", "role": "candidate", "name": "Demo Candidate", "email": "candidate@gmail.com", "headline": "Software Developer", "location": "Colombo, Sri Lanka", "experience": 2, "skills": "React, JavaScript, Python, SQL, Communication, Problem Solving", "technicalSkills": "React, JavaScript, Python, SQL", "softSkills": "Communication, Problem Solving, Teamwork", "bio": "Software developer interested in building reliable web applications."}
@@ -134,31 +171,7 @@ def safe_portfolio_url(value):
 
 
 def safe_linkedin_url(value):
-    value = str(value or "").strip().replace("\\.", ".")
-    if not value:
-        return None
-    # LinkedIn displays public profile URLs without a scheme in several places.
-    # Store one canonical, clickable form regardless of how the candidate pasted it.
-    if "://" not in value:
-        value = f"https://{value.lstrip('/')}"
-    try:
-        parsed = urlparse(value)
-        host = (parsed.hostname or "").casefold()
-        valid_host = host in {"linkedin.com", "www.linkedin.com"} or host.endswith(".linkedin.com")
-        path_parts = [part for part in parsed.path.split("/") if part]
-        valid_path = (
-            len(path_parts) >= 2
-            and (
-                path_parts[0].casefold() in {"in", "posts"}
-                or [part.casefold() for part in path_parts[:2]] == ["feed", "update"]
-            )
-        )
-        if parsed.scheme.casefold() not in {"http", "https"} or not valid_host or not valid_path:
-            return None
-        canonical_path = "/" + "/".join(path_parts)
-        return f"https://www.linkedin.com{canonical_path}"
-    except ValueError:
-        return None
+    return normalize_profile_url(value)
 
 
 def ensure_database():
@@ -213,7 +226,11 @@ def startup_database():
 @app.get("/api/health")
 def health():
     ensure_database()
-    return {"status": "ok", "database": "connected"}
+    return {
+        "status": "ok",
+        "database": "connected",
+        "app_dir": str(Path(__file__).resolve().parent),
+    }
 
 
 def require_session(token):
@@ -221,7 +238,8 @@ def require_session(token):
     session = db.sessions.find_one({"token": token})
     if not session:
         raise HTTPException(status_code=401, detail="Please sign in again.")
-    user = db.users.find_one({"id": session["userId"]})
+    user_id = session.get("userId") or session.get("user_id")
+    user = db.users.find_one({"id": user_id}) if user_id else None
     if not user:
         raise HTTPException(status_code=401, detail="Session user no longer exists.")
     return public_document(user)
@@ -277,10 +295,12 @@ def app_data(token: str):
         applications = [public_document(item) for item in db.applications.find({"jobId": {"$in": job_ids}}).sort("appliedAt", -1)]
         for application in applications:
             snapshot = application.setdefault("candidateSnapshot", {})
+            candidate = db.users.find_one({"id": application.get("userId")}, {"portfolioUrl": 1, "linkedinUrl": 1}) or {}
+            profile = db.candidates.find_one({"id": application.get("userId")}, {"social_links": 1}) or {}
             if not snapshot.get("portfolioUrl"):
-                candidate = db.users.find_one({"id": application.get("userId")}, {"portfolioUrl": 1}) or {}
-                profile = db.candidates.find_one({"id": application.get("userId")}, {"social_links": 1}) or {}
                 snapshot["portfolioUrl"] = safe_portfolio_url(candidate.get("portfolioUrl") or (profile.get("social_links") or {}).get("portfolio_url"))
+            if not snapshot.get("linkedinUrl"):
+                snapshot["linkedinUrl"] = safe_linkedin_url(candidate.get("linkedinUrl") or (profile.get("social_links") or {}).get("linkedin_url"))
             candidate_privacy = db.users.find_one({"id": application.get("userId")}, {"profilePhotoUrl": 1, "photoVisibleToRecruiters": 1}) or {}
             snapshot["profilePhotoUrl"] = candidate_privacy.get("profilePhotoUrl") if candidate_privacy.get("photoVisibleToRecruiters") is True else None
             snapshot["photoVisibleToRecruiters"] = candidate_privacy.get("photoVisibleToRecruiters") is True
@@ -316,6 +336,15 @@ def update_profile(payload: DocumentPayload, token: str):
     save_manual_profile(db, user, changes)
     updated = db.users.find_one_and_update({"id": user["id"]}, {"$set": changes}, return_document=ReturnDocument.AFTER)
     return public_document(updated)
+
+
+@app.post("/api/candidates/me/reset-profile")
+def reset_candidate_profile_route(token: str):
+    user = require_session(token)
+    if user.get("role") != "candidate":
+        raise HTTPException(status_code=403, detail="Only candidates can reset their profile.")
+    result = reset_candidate_profile(db, user["id"])
+    return result
 
 
 @app.post("/api/profile/photo")
@@ -488,28 +517,34 @@ async def verify_candidate_github(payload: DocumentPayload, token: str):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+def save_linkedin_profile_url(candidate_id, value, source="candidate"):
+    canonical = safe_linkedin_url(value)
+    if not canonical:
+        raise LinkedInVerificationError("Enter a valid public LinkedIn profile URL such as https://www.linkedin.com/in/username.")
+    verification = {
+        "url": canonical,
+        "verification_status": "verified_url",
+        "verified_at": utcnow().isoformat(),
+        "evidence_type": "linkedin_profile_url",
+        "source": source,
+        "ownership_verified": False,
+    }
+    db.users.update_one({"id": candidate_id}, {"$set": {"linkedinUrl": canonical, "linkedinVerification": verification}})
+    db.candidate_profiles.update_one({"id": candidate_id}, {"$set": {
+        "social_links.linkedin_url": canonical, "linkedin_verification": verification}}, upsert=True)
+    audit(db, "linkedin_url_verified", candidate_id, "candidate", candidate_id, {"url": canonical, "source": source})
+    return verification
+
+
 @app.post("/api/candidates/me/linkedin/verify")
 def verify_candidate_linkedin(payload: DocumentPayload, token: str):
     user = require_session(token)
     if user["role"] != "candidate":
         raise HTTPException(status_code=403, detail="Only candidates can verify LinkedIn evidence.")
-    value = safe_linkedin_url(payload.data.get("linkedin_url"))
-    if not value:
-        raise HTTPException(status_code=422, detail="Enter a valid LinkedIn profile or post URL.")
-    verified_at = utcnow().isoformat()
-    verification = {
-        "url": value,
-        "verification_status": "verified_url",
-        "verified_at": verified_at,
-        "evidence_type": "linkedin_url",
-    }
-    db.users.update_one({"id": user["id"]}, {"$set": {"linkedinUrl": value, "linkedinVerification": verification}})
-    db.candidate_profiles.update_one(
-        {"id": user["id"]},
-        {"$set": {"social_links.linkedin_url": value, "linkedin_verification": verification}},
-    )
-    audit(db, "linkedin_url_verified", user["id"], "candidate", user["id"], {"url": value})
-    return verification
+    try:
+        return save_linkedin_profile_url(user["id"], payload.data.get("linkedin_url"))
+    except LinkedInVerificationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/api/candidates/me/portfolio/verify")
@@ -698,6 +733,7 @@ async def preview_candidate_evaluation(job_id: str, token: str):
         candidate.pop(excluded, None)
     result, provider = await evaluate_enterprise_job(public_document(job), candidate, generate_json if model else None)
     return {**result, "score": result["candidate_score"], "evaluation_provider": provider,
+            "scoring_rules_version": SCORING_RULES_VERSION,
             "preview": True, "authoritative_score_calculated_on_application": True}
 
 
@@ -769,12 +805,14 @@ async def create_application(payload: DocumentPayload, token: str):
         "githubEvidence": github_snapshot if has_verified_github else None,
         "githubSnapshotId": snapshot_id if has_verified_github else None,
         "evaluationVersion": 1,
+        "scoringRulesVersion": SCORING_RULES_VERSION,
         "finalDecision": pending_decision(),
         "appliedAt": datetime.now(timezone.utc).isoformat()
     }
     submitted_snapshot = application.get("candidateSnapshot") if isinstance(application.get("candidateSnapshot"), dict) else {}
     application["candidateSnapshot"] = {**submitted_snapshot,
         "portfolioUrl": safe_portfolio_url(user.get("portfolioUrl") or (cand_profile.get("social_links") or {}).get("portfolio_url")),
+        "linkedinUrl": safe_linkedin_url(user.get("linkedinUrl") or (cand_profile.get("social_links") or {}).get("linkedin_url")),
         "profilePhotoUrl": user.get("profilePhotoUrl") if user.get("photoVisibleToRecruiters") is True else None,
         "photoVisibleToRecruiters": user.get("photoVisibleToRecruiters") is True}
     db.applications.insert_one(application)
@@ -792,8 +830,8 @@ async def create_application(payload: DocumentPayload, token: str):
             "github_verified": has_verified_github,
             "github_snapshot_id": snapshot_id,
         },
-        "scoring_rules_version": "2.5",
-        "model_version": model or "gemini-3.5-flash-lite",
+        "scoring_rules_version": SCORING_RULES_VERSION,
+        "model_version": None,
         "candidate_profile_score": cand_prof_score_res["overall_score"],
         "job_match_score": enterprise_result["candidate_score"],
         "recommended_decision": (enterprise_result.get("recommendation") or {}).get("decision"),
@@ -819,7 +857,8 @@ async def create_application(payload: DocumentPayload, token: str):
         "candidate_id": user["id"],
         "job_id": job["id"],
         "ai_provider": evaluation_provider,
-        "model": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+        "model": None,
+        "scoring_rules_version": SCORING_RULES_VERSION,
         "scores": scores,
         "pre_interview_score": pre_interview,
         "profile_score": profile_summary,
@@ -834,7 +873,8 @@ async def create_application(payload: DocumentPayload, token: str):
         "skill_analysis": enterprise_result.get("skill_analysis", []),
         "audit_snapshot": {"candidate_profile_version": cand_profile.get("version", 1), "cv_version": 1,
             "job_requirements_version": job.get("requirements_version", 1), "weight_configuration_version": job.get("weight_configuration_version", 1),
-            "github_snapshot_id": snapshot_id if has_verified_github else None, "gemini_model": model, "prompt_version": "enterprise-job-match-v2"},
+            "github_snapshot_id": snapshot_id if has_verified_github else None,
+            "scoring_rules_version": SCORING_RULES_VERSION},
     }
     db.ai_evaluations.insert_one(evaluation)
     db.applications.update_one({"id": application["id"]}, {"$set": {
@@ -904,7 +944,8 @@ async def re_evaluate_application(application_id: str, token: str):
         "candidate_id": candidate_id,
         "job_id": job["id"],
         "ai_provider": evaluation_provider,
-        "model": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+        "model": None,
+        "scoring_rules_version": SCORING_RULES_VERSION,
         "scores": scores,
         "pre_interview_score": pre_interview,
         "raw_result": raw_evaluation,
@@ -933,6 +974,7 @@ async def re_evaluate_application(application_id: str, token: str):
         "githubEvidence": github_snapshot if has_verified_github else None,
         "githubSnapshotId": snapshot_id if has_verified_github else None,
         "evaluationVersion": next_version,
+        "scoringRulesVersion": SCORING_RULES_VERSION,
         "evaluatedAt": evaluation["evaluated_at"],
     }})
     updated_app = db.applications.find_one({"id": application["id"]})
@@ -972,40 +1014,162 @@ def logout(token: str):
     return {"ok": True}
 
 MAX_CV_SIZE = 10 * 1024 * 1024
-SUPPORTED_CV_TYPES = {
-    "application/pdf": ".pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-    "text/plain": ".txt",
+SUPPORTED_CV_EXTENSIONS = {".pdf", ".docx", ".txt", ".jpg", ".jpeg", ".png", ".webp"}
+VISUAL_CV_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
 }
+
+
+def _cv_extraction_has_content(extraction):
+    personal = extraction.personal_info
+    personal_count = sum(bool(value) for value in (
+        personal.full_name, personal.email, personal.phone, personal.location, personal.professional_title
+    ))
+    section_count = sum(len(items) for items in (
+        extraction.technical_skills, extraction.soft_skills, extraction.experience, extraction.projects,
+        extraction.education, extraction.certifications, extraction.languages,
+    ))
+    return personal_count >= 2 or (personal_count >= 1 and section_count >= 2) or section_count >= 4
+
+
+def _normalize_cv_payload(payload):
+    """Repair harmless model shape variations before strict domain validation."""
+    if not isinstance(payload, dict):
+        raise ValueError("Gemini CV extraction must be a JSON object.")
+    normalized_payload = dict(payload)
+    personal_info = normalized_payload.get("personal_info")
+    github_info = normalized_payload.get("github")
+    normalized_payload["personal_info"] = personal_info if isinstance(personal_info, dict) else {}
+    normalized_payload["github"] = github_info if isinstance(github_info, dict) else {}
+    normalized_payload["github"]["repositories"] = []
+    for field in ("technical_skills", "soft_skills", "experience", "projects", "education", "certifications", "languages"):
+        value = normalized_payload.get(field)
+        normalized_payload[field] = value if isinstance(value, list) else []
+
+    for field in ("technical_skills", "soft_skills"):
+        normalized_payload[field] = [
+            {"skill": item} if isinstance(item, str) else item
+            for item in normalized_payload[field]
+            if isinstance(item, (str, dict))
+        ]
+    normalized_payload["languages"] = [
+        {"language": item} if isinstance(item, str) else item
+        for item in normalized_payload["languages"]
+        if isinstance(item, (str, dict))
+    ]
+    for field in ("experience", "projects", "education", "certifications"):
+        normalized_payload[field] = [item for item in normalized_payload[field] if isinstance(item, dict)]
+
+    def normalize_list_field(item, field, split_commas=False):
+        value = item.get(field)
+        if value is None:
+            item[field] = []
+        elif isinstance(value, str):
+            item[field] = ([part.strip() for part in value.split(",") if part.strip()]
+                           if split_commas else [value.strip()])
+        elif not isinstance(value, list):
+            item[field] = []
+
+    for item in normalized_payload["technical_skills"]:
+        if isinstance(item, dict):
+            normalize_list_field(item, "evidence")
+            if item.get("confidence") is None:
+                item.pop("confidence", None)
+    for item in normalized_payload["soft_skills"]:
+        if isinstance(item, dict) and item.get("confidence") is None:
+            item.pop("confidence", None)
+    for item in normalized_payload["experience"]:
+        for field in ("responsibilities", "achievements"):
+            normalize_list_field(item, field)
+        normalize_list_field(item, "technologies", split_commas=True)
+        if item.get("confidence") is None:
+            item.pop("confidence", None)
+    for item in normalized_payload["projects"]:
+        normalize_list_field(item, "technologies", split_commas=True)
+        normalize_list_field(item, "achievements")
+        if item.get("confidence") is None:
+            item.pop("confidence", None)
+    for item in normalized_payload["certifications"]:
+        normalize_list_field(item, "relevant_skills", split_commas=True)
+        if item.get("confidence") is None:
+            item.pop("confidence", None)
+
+    def normalize_url(value):
+        if not value:
+            return None
+        value = re.sub(r"\s+", "", str(value or "").strip()).rstrip(".,;:)>}\]\'\"")
+        if not value:
+            return None
+        if not re.match(r"^https?://", value, re.IGNORECASE):
+            if re.match(r"^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(/.*)?$", value):
+                value = f"https://{value}"
+        parsed = urlparse(value)
+        return value if parsed.scheme in {"http", "https"} and parsed.netloc else None
+
+    if not normalized_payload.get("languages") and normalized_payload.get("human_languages"):
+        normalized_payload["languages"] = normalized_payload["human_languages"]
+
+    social_links = normalized_payload.get("social_links") or {}
+    personal = normalized_payload["personal_info"]
+    personal["linkedin_url"] = normalize_url(personal.get("linkedin_url") or social_links.get("linkedin_url"))
+    personal["portfolio_url"] = normalize_url(personal.get("portfolio_url") or social_links.get("portfolio_url"))
+    if personal.get("professional_title") and not personal.get("headline"):
+        personal["headline"] = personal["professional_title"]
+    elif personal.get("headline") and not personal.get("professional_title"):
+        personal["professional_title"] = personal["headline"]
+    github = normalized_payload["github"]
+    github["profile_url"] = normalize_url(github.get("profile_url") or social_links.get("github_url"))
+    for item in normalized_payload["experience"]:
+        if not item.get("position") and item.get("role"):
+            item["position"] = item["role"]
+        if not item.get("technologies") and item.get("skills_used"):
+            item["technologies"] = item["skills_used"]
+    for item in normalized_payload["projects"]:
+        item["github_url"] = normalize_url(item.get("github_url"))
+        item["demo_url"] = normalize_url(item.get("demo_url"))
+    for item in normalized_payload["certifications"]:
+        item["credential_url"] = normalize_url(item.get("credential_url"))
+    return normalized_payload
+
+
+def _cv_extraction_text(extraction):
+    """Create complete semantic text for downstream job analysis from validated extraction."""
+    return json.dumps(extraction.model_dump(mode="json"), ensure_ascii=False, indent=2)
 
 
 @app.post("/api/import-cv")
 async def import_cv(file: UploadFile = File(...), token: str = ""):
     extension = os.path.splitext(file.filename or "")[1].lower()
-    if extension not in {".pdf", ".docx", ".txt"}:
-        raise HTTPException(status_code=415, detail="Only PDF, DOCX, and TXT files are supported.")
+    if extension not in SUPPORTED_CV_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Only PDF, DOCX, TXT, JPG, PNG, and WebP CV files are supported.")
 
     content = await file.read(MAX_CV_SIZE + 1)
     if len(content) > MAX_CV_SIZE:
         raise HTTPException(status_code=413, detail="CV file must be 10 MB or smaller.")
 
+    media_mime_type = VISUAL_CV_MIME_TYPES.get(extension)
     try:
-        if extension == ".pdf":
-            reader = PdfReader(io.BytesIO(content))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        elif extension == ".docx":
-            document = Document(io.BytesIO(content))
-            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
-        else:
-            text = content.decode("utf-8-sig")
+        text, document_links = extract_cv_content(content, extension)
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Could not read this CV: {exc}") from exc
+        if media_mime_type:
+            text, document_links = "", []
+        else:
+            raise HTTPException(status_code=422, detail=f"Could not read this CV: {exc}") from exc
 
     text = text.strip()
-    if not text:
+    is_scanned_pdf = (extension == ".pdf" and len(text) < 80)
+    use_visual_mode = bool(media_mime_type and (extension != ".pdf" or is_scanned_pdf))
+    effective_media_data = content if use_visual_mode else None
+    effective_media_mime = media_mime_type if use_visual_mode else None
+
+    if not text and not effective_media_data:
         raise HTTPException(
             status_code=422,
-            detail="No readable text was found. Scanned PDFs are not supported yet.",
+            detail="No readable text or visual document was found in this CV.",
         )
 
     response = {"filename": file.filename, "text": text}
@@ -1017,30 +1181,85 @@ async def import_cv(file: UploadFile = File(...), token: str = ""):
         db.cv_documents.insert_one({"id": document_id, "candidate_id": user["id"], "file_name": file.filename,
             "content_type": file.content_type, "content": content, "uploaded_at": utcnow(), "parsing_status": "processing"})
         response["document_id"] = document_id
-        if model:
-            prompt = f"""Extract only facts explicitly written in this CV. Never infer or guess missing information.
-Use null or [] when unavailable. Repository statistics must be empty; only copy a GitHub URL present in the CV.
-For English, Sinhala, and Tamil, return speaking_level, reading_level, and writing_level using only Basic, Moderate, or Fluent.
-Map native/bilingual/advanced to Fluent, intermediate/conversational to Moderate, and beginner/elementary to Basic.
-If one overall level is written, use it for all three. If no level is written, use Basic conservatively.
-Return only JSON matching this schema: {json.dumps(CvExtraction.model_json_schema())}
-CV:\n{text[:MAX_AI_TEXT_LENGTH]}"""
+        linkedin_url = find_linkedin_profile_url(text, document_links)
+        if linkedin_url:
             try:
-                raw = await generate_json(prompt)
-                extraction = CvExtraction.model_validate(raw)
+                response["linkedin_verification"] = save_linkedin_profile_url(user["id"], linkedin_url, source="cv")
+                response["linkedin_verification_status"] = "verified_url"
+            except LinkedInVerificationError as linkedin_exc:
+                response["linkedin_verification_status"] = "invalid"
+                response["linkedin_verification_error"] = str(linkedin_exc)
+        if model:
+            prompt = f"""Extract complete, factual professional information from this CV matching the required JSON schema.
+Never invent missing details. Transcribe only facts explicitly stated in the CV.
+
+Required JSON Schema:
+{EXTRACTION_SCHEMA_JSON}
+
+CV CONTENT:
+{text[:120000] if text else '[Visual document attached. Transcribe and extract all visible details according to the schema.]'}
+"""
+            try:
+                extraction = None
+                raw = None
+                extraction_error = None
+                for attempt in range(2):
+                    attempt_prompt = prompt
+                    if attempt:
+                        attempt_prompt += (
+                            "\nA previous pass was incomplete or did not match the schema. Re-read the entire CV from top to "
+                            "bottom, audit every section, and return one complete, factual JSON object."
+                        )
+                    try:
+                        candidate_raw = await generate_json(
+                            attempt_prompt,
+                            max_output_tokens=16384,
+                            timeout=120,
+                            media_data=effective_media_data,
+                            media_mime_type=effective_media_mime,
+                            system_instruction=SYSTEM_EXTRACTION_INSTRUCTION,
+                        )
+                        normalized_payload = normalize_cv_extraction(candidate_raw, cv_text=text)
+                        candidate_extraction = CvExtraction.model_validate(normalized_payload)
+                        extraction = candidate_extraction
+                        raw = candidate_raw
+                        break
+                    except Exception as exc:
+                        extraction_error = exc
+
+                if extraction is None:
+                    raise extraction_error or ValueError("Gemini returned no usable CV details.")
+
                 save_extraction(db, user["id"], extraction, document_id, file.filename, os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"))
-                response["structured_extraction"] = extraction.model_dump(mode="json")
+                extraction_response = extraction.model_dump(mode="json")
+                extraction_response["technical_skills"] = enriched_technical_skills(extraction_response)
+                response["structured_extraction"] = extraction_response
+                response["text"] = _cv_extraction_text(extraction)
 
                 # Perform candidate profile intelligence analysis, scoring, GitHub verification & analysis run recording
-                intel_res = await cv_analysis_service.analyze_and_store_cv(user["id"], text, file.filename, document_id)
+                intel_res = await cv_analysis_service.analyze_and_store_cv(
+                    user["id"], response["text"], file.filename, document_id,
+                    structured_extraction=extraction_response,
+                )
                 response["candidate_profile"] = intel_res.get("candidate")
                 response["candidate_profile_score"] = intel_res.get("candidate_profile_score")
                 response["score_breakdown"] = intel_res.get("score_breakdown")
                 response["analysis_run_id"] = intel_res.get("analysis_run_id")
 
-                if extraction.github.profile_url:
+                if not linkedin_url and extraction.personal_info.linkedin_url:
+                    linkedin_url = str(extraction.personal_info.linkedin_url)
                     try:
-                        snapshot = await save_verified_github(user["id"], str(extraction.github.profile_url))
+                        response["linkedin_verification"] = save_linkedin_profile_url(user["id"], linkedin_url, source="cv")
+                        response["linkedin_verification_status"] = "verified_url"
+                    except LinkedInVerificationError as linkedin_exc:
+                        response["linkedin_verification_status"] = "invalid"
+                        response["linkedin_verification_error"] = str(linkedin_exc)
+
+                github_url = (str(extraction.github.profile_url) if extraction.github.profile_url else None)
+                github_url = github_url or find_github_profile_url(text, document_links)
+                if github_url:
+                    try:
+                        snapshot = await save_verified_github(user["id"], github_url)
                         response["github_verification_status"] = "verified"
                         response["github_snapshot_id"] = snapshot.get("id")
                     except GithubVerificationError as github_exc:
@@ -1048,17 +1267,15 @@ CV:\n{text[:MAX_AI_TEXT_LENGTH]}"""
                         response["github_verification_error"] = str(github_exc)
                 db.cv_documents.update_one({"id": document_id}, {"$set": {"parsing_status": "completed", "parsed_at": utcnow(), "raw_gemini_result": raw}})
                 response["structured_status"] = "completed"
+                response["extraction_mode"] = "document_vision" if media_mime_type else "document_text"
             except Exception as exc:
                 error_text = str(exc).strip() or exc.__class__.__name__
                 db.cv_documents.update_one({"id": document_id}, {"$set": {"parsing_status": "failed", "parsing_error": error_text, "parsed_at": utcnow()}})
-                response["structured_status"] = "failed"
+                raise HTTPException(status_code=502, detail=f"Could not extract complete CV details: {error_text}") from exc
         else:
             db.cv_documents.update_one({"id": document_id}, {"$set": {"parsing_status": "pending_ai"}})
             response["structured_status"] = "pending_ai"
     return response
-
-api_key = os.environ.get("GEMINI_API_KEY", "")
-model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite") if api_key else None
 
 MAX_AI_TEXT_LENGTH = 30000
 
@@ -1264,9 +1481,16 @@ def local_analysis(job_skills, cv_text, candidate_experience=0, required_experie
     return result
 
 
-async def generate_json(prompt: str, max_output_tokens: int = 8192, timeout: int = 60):
+async def generate_json(prompt: str, max_output_tokens: int = 8192, timeout: int = 60,
+                        media_data: bytes | None = None, media_mime_type: str | None = None,
+                        system_instruction: str | None = None):
     """Call Gemini REST directly without blocking FastAPI or loading an SDK."""
-    return await asyncio.to_thread(generate_gemini_json, api_key, model, prompt, max_output_tokens, timeout)
+    current_key = api_key or os.environ.get("GEMINI_API_KEY", "")
+    current_model = model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    return await asyncio.to_thread(
+        generate_gemini_json, current_key, current_model, prompt, max_output_tokens, timeout,
+        media_data, media_mime_type, system_instruction,
+    )
 
 
 @app.post("/api/extract-skills")
@@ -1275,17 +1499,17 @@ async def extract_skills(cv_text: str = Form(...)):
         raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured.")
 
     prompt = f"""
-    Extract EVERY single professional and technical skill from this CV using Gemini API.
-    Categorize explicitly into technical_skills and soft_skills.
-    Technical skills MUST include ALL programming languages, frameworks, web technologies, APIs, databases, libraries, tools, cloud platforms, operating systems, and technical competencies mentioned in the CV (e.g. Python, Java, JavaScript, HTML, CSS, React, FastAPI, REST APIs, MySQL, SQL, Git, GitHub, Postman, VS Code, Windows, Linux, AWS, Machine Learning, Data Analysis, MS Word, Excel, PowerPoint, etc.).
-    Soft skills include communication, leadership, teamwork, problem solving, time management, collaboration, adaptability, etc.
-    Normalize equivalent spellings (for example: js -> JavaScript). Remove duplicates case-insensitively.
-    Do not return names, email, phone numbers, company names, job titles, schools, or locations as skills.
+    Extract EVERY professional skill explicitly evidenced in this CV, for any occupation or industry.
+    
+    UNIVERSAL CV RULE FOR SKILL CLASSIFICATION:
+    1. technical_skills: Include all role-specific hard/functional skills, domain competencies, operational methods, tools, software, platforms, management disciplines, regulations, or technical processes (e.g. Financial Reporting, Patient Care, Digital Marketing, Inventory Management, Recruitment, Project Management, AutoCAD, Data Analysis, Accounting, Budgeting, HRIS, CRM, etc.).
+    2. soft_skills: Include ONLY skills describing how a person communicates, collaborates, leads people, thinks, adapts, organizes themselves, builds relationships, resolves interpersonal situations, or behaves at work (e.g. Communication, Teamwork, Leadership, Adaptability, Negotiation, Conflict Resolution, Problem Solving, Critical Thinking, Time Management, Attention to Detail). Never put functional/domain competencies (like Project Management, Financial Reporting, or Patient Care) in soft_skills. When uncertain, exclude from soft_skills.
+
     Return ONLY valid JSON with no markdown:
     {{
-        "technical_skills": ["Python", "Java", "JavaScript", "HTML", "CSS", "React", "FastAPI", "REST APIs", "MySQL", "SQL", "Git", "GitHub", "Postman", "VS Code", "Windows", "Linux", "AWS", "Machine Learning", "Data Analysis", "MS Word", "Excel", "PowerPoint"],
-        "soft_skills": ["Communication", "Problem Solving", "Teamwork"],
-        "skills": ["Python", "Java", "JavaScript", "HTML", "CSS", "React", "FastAPI", "REST APIs", "MySQL", "SQL", "Git", "GitHub", "Postman", "VS Code", "Windows", "Linux", "AWS", "Machine Learning", "Data Analysis", "MS Word", "Excel", "PowerPoint", "Communication", "Problem Solving", "Teamwork"]
+        "technical_skills": ["role-specific hard or functional skill"],
+        "soft_skills": ["interpersonal or behavioral skill"],
+        "skills": ["all deduplicated professional skills"]
     }}
 
     CV:
@@ -1293,12 +1517,23 @@ async def extract_skills(cv_text: str = Form(...)):
     """
     try:
         result = await generate_json(prompt)
-        tech = result.get("technical_skills", [])
-        soft = result.get("soft_skills", [])
-        all_skills = result.get("skills", tech + soft)
+        raw_tech = result.get("technical_skills", [])
+        raw_soft = result.get("soft_skills", [])
+        
+        # Enforce Universal CV Rule on soft skills
+        clean_tech = list(raw_tech)
+        clean_soft = []
+        for s in raw_soft:
+            if is_soft_skill_candidate(s):
+                clean_soft.append(s)
+            else:
+                if s not in clean_tech:
+                    clean_tech.append(s)
+
+        all_skills = result.get("skills", clean_tech + clean_soft)
         return {
-            "technical_skills": tech,
-            "soft_skills": soft,
+            "technical_skills": clean_tech,
+            "soft_skills": clean_soft,
             "skills": all_skills,
         }
     except Exception as exc:
@@ -1332,17 +1567,21 @@ async def analyze_cv(
         return local_analysis(job_skills, cv_text, candidate_experience, required_experience)
         
     prompt = f"""
-    You are an expert Applicant Tracking System AI.
+    You are an expert, industry-neutral Applicant Tracking System AI for technical and non-technical jobs.
     Job Title: {job_title}
     Required Skills: {job_skills}
     Required Experience: {required_experience} years
     Candidate Experience: {candidate_experience} years
     Candidate information: {cv_text[:MAX_AI_TEXT_LENGTH]}
     
-    Analyze the candidate against the job requirements. Extract only genuine professional
-    skills and normalize equivalent spellings. Never include names, emails, phone numbers,
+    Analyze the candidate against the actual job requirements without assuming the role is a software job.
+    Treat technical_skills as the existing API field for job-specific hard/functional competencies in any field, including
+    HR, recruiting, management, operations, sales, customer service, finance, healthcare, education, engineering, trades,
+    tools, platforms, processes, methodologies, regulations, and software. Extract only genuine professional skills and
+    normalize equivalent spellings. Never include names, emails, phone numbers,
     employers, schools, job titles, or locations in extracted_skills. Remove duplicate skills.
-    In profile_details, extract EVERY single candidate skill present in the CV text into technical_skills (programming languages, frameworks, web tech, databases, tools, cloud, OS, ML, office software like Python, Java, JavaScript, HTML, CSS, React, FastAPI, REST APIs, MySQL, SQL, Git, GitHub, Postman, VS Code, Windows, Linux, AWS, Machine Learning, Data Analysis, MS Word, Excel, PowerPoint) and soft_skills (communication, leadership, problem solving, teamwork, adaptability). Do NOT restrict technical_skills to only the job requirements!
+    In profile_details, extract every evidenced functional/hard skill into technical_skills and every evidenced interpersonal
+    skill into soft_skills. Do not restrict either list to job requirements and do not favor software terminology.
     Evaluate every required skill as Full, Partial, or Missing. Full requires explicit evidence
     or a clearly equivalent skill. Partial means transferable or prerequisite knowledge and
     always receives 0.5 credit. Missing receives 0 credit. Include a short evidence phrase from

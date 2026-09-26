@@ -1,5 +1,6 @@
 """Job Matching Service for evaluating candidate fit against specific job requirements."""
 
+import math
 from typing import Any, Dict, List, Optional
 from models.score import RecommendedDecision
 
@@ -22,6 +23,15 @@ def skills_match(left: str, right: str) -> bool:
     )
 
 
+def nonnegative_number(value: Any) -> float:
+    """Coerce optional stored numeric values without letting malformed profile data crash scoring."""
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if math.isfinite(number) and number > 0 else 0.0
+
+
 class JobMatchService:
     @staticmethod
     def calculate_job_match_score(
@@ -37,7 +47,7 @@ class JobMatchService:
         job_id = job_data.get("id") or "job_default"
         job_title = job_data.get("title", "Target Role")
         req_skills = [s.strip() for s in str(job_data.get("skills", "")).split(",") if s.strip()]
-        req_years = float(job_data.get("experience") or 0.0)
+        req_years = nonnegative_number(job_data.get("experience"))
 
         tech_skills = candidate_data.get("technical_skills") or []
         prog_langs = candidate_data.get("programming_languages") or []
@@ -62,7 +72,9 @@ class JobMatchService:
         skills_score = round(skill_ratio * 25.0, 1)
 
         # 2. Job Experience Relevance (Max 20)
-        total_cand_years = candidate_data.get("personal_info", {}).get("experience_years") or sum(e.get("duration_months", 0) for e in experiences) / 12.0
+        personal_years = nonnegative_number((candidate_data.get("personal_info") or {}).get("experience_years"))
+        duration_years = sum(nonnegative_number(e.get("duration_months")) for e in experiences) / 12.0
+        total_cand_years = personal_years or duration_years
         if req_years > 0:
             exp_ratio = min(1.0, total_cand_years / req_years)
             exp_score = round(exp_ratio * 20.0, 1)

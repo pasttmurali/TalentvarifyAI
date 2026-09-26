@@ -93,9 +93,12 @@ def _curl_request(path, headers, allow_missing=False):
         safe_value = str(value).replace('"', '')
         config.append(f'header = "{name}: {safe_value}"')
     try:
+        config_bytes = "\n".join(config).encode("utf-8")
         result = subprocess.run([executable, "--config", "-", "--write-out", "\n%{http_code}"],
-                                input="\n".join(config), capture_output=True, text=True, timeout=25, check=False)
-        body, _, status_text = result.stdout.rpartition("\n")
+                                input=config_bytes, capture_output=True,
+                                timeout=25, check=False)
+        stdout_text = result.stdout.decode("utf-8", errors="replace") if isinstance(result.stdout, bytes) else str(result.stdout or "")
+        body, _, status_text = stdout_text.rpartition("\n")
         status = int(status_text) if status_text.isdigit() else 0
         if allow_missing and status == 404:
             return None, {}

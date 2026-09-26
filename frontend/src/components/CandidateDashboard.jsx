@@ -2,13 +2,26 @@ import React, { useEffect, useRef, useState } from 'react';
 import { AlertCircle, Briefcase, CheckCircle, Clock3, FileText, Loader2, MapPin, Search, Target, Upload, X } from 'lucide-react';
 import { apiForm, apiRequest } from '../services/api';
 
+// =========================================================================================
+// FILE: CandidateDashboard.jsx
+// PURPOSE: Candidate portal to browse jobs, upload CVs, view AI match scores, and apply.
+// =========================================================================================
+
 export default function CandidateDashboard({ jobs = [], user, token, applications = [], onSaveProfile, onApply, onWithdraw, onNavigateProfile }) {
+  // ---------------------------------------------------------------------------------------
+  // STEP 1: REFS & DOM ANCHORS
+  // WHY THIS STEP:
+  // - 'fileInputRef': Provides programmatic access to the hidden file input element.
+  // - 'applicationsRef': Enables smooth auto-scrolling to the applications history section.
+  // ---------------------------------------------------------------------------------------
   const fileInputRef = useRef(null);
   const applicationsRef = useRef(null);
   const [selectedJobId, setSelectedJobId] = useState(jobs[0]?.id || null);
   const [cvText, setCvText] = useState('');
   const [fileName, setFileName] = useState('');
   const [importing, setImporting] = useState(false);
+  const [importStep, setImportStep] = useState(0);
+  const [importElapsed, setImportElapsed] = useState(0);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -44,34 +57,73 @@ export default function CandidateDashboard({ jobs = [], user, token, application
     return merged.join(', ');
   };
 
+  // ---------------------------------------------------------------------------------------
+  // STEP 2: CV UPLOAD & GEMINI AI EXTRACTION PIPELINE
+  // WHY THIS STEP:
+  // - Validates file format (PDF, DOCX, TXT, images) and size limit (<= 10MB).
+  // - Sends file to /api/import-cv where backend extracts text & runs Gemini AI entity parser.
+  // - Merges extracted hard & soft skills into candidate profile without overwriting existing data.
+  // ---------------------------------------------------------------------------------------
   const handleImport = async (file) => {
     if (!file) return;
     const extension = file.name.split('.').pop()?.toLowerCase();
-    if (!['pdf', 'docx', 'txt'].includes(extension)) { setError('Please choose a PDF, DOCX, or TXT file.'); return; }
+    if (!['pdf', 'docx', 'txt', 'jpg', 'jpeg', 'png', 'webp'].includes(extension)) { setError('Please choose a PDF, DOCX, TXT, JPG, PNG, or WebP file.'); return; }
     if (file.size > 10 * 1024 * 1024) { setError('CV file must be 10 MB or smaller.'); return; }
     setImporting(true); setError(''); setMessage(''); setResult(null);
+    setImportStep(0); setImportElapsed(0);
+    const importStepTimer = setInterval(() => setImportStep((s) => (s + 1) % 4), 4000);
+    const importElapsedTimer = setInterval(() => setImportElapsed((e) => e + 1), 1000);
     try {
       const uploadData = new FormData(); uploadData.append('file', file);
       const imported = await apiForm(`/api/import-cv?token=${encodeURIComponent(token)}`, uploadData);
 
-      const analysisData = new FormData();
-      analysisData.append('job_title', selectedJob?.title || 'General Candidate Profile');
-      analysisData.append('job_skills', jobSkills);
-      analysisData.append('cv_text', imported.text);
-      analysisData.append('candidate_experience', Number(user.experience || 0));
-      analysisData.append('required_experience', Number(selectedJob?.experience || 0));
-      const analysis = await apiForm('/api/analyze-cv', analysisData);
+      let details, extractedTech, extractedSoft, extractedSkills;
 
-      const details = analysis.profile_details || {};
-      const extractedTech = details.technical_skills || [];
-      const extractedSoft = details.soft_skills || [];
-      const extractedSkills = analysis.extracted_skills || [...extractedTech, ...extractedSoft];
+      if (imported.structured_extraction) {
+        // Primary path: use the full Gemini-parsed CV structure
+        const extracted = imported.structured_extraction;
+        extractedTech = (extracted.technical_skills || []).map((item) => (typeof item === 'object' ? item.skill : item)).filter(Boolean);
+        extractedSoft = (extracted.soft_skills || []).map((item) => (typeof item === 'object' ? item.skill : item)).filter(Boolean);
+        extractedSkills = [...extractedTech, ...extractedSoft];
+        const months = (extracted.experience || []).reduce((sum, item) => sum + Number(item.duration_months || 0), 0);
+        const expYears = extracted.personal_info?.experience_years != null
+          ? Number(extracted.personal_info.experience_years)
+          : (months ? Math.round((months / 12) * 10) / 10 : 0);
+        details = {
+          name: extracted.personal_info?.full_name || '',
+          headline: extracted.personal_info?.headline || extracted.personal_info?.professional_title || '',
+          phone: extracted.personal_info?.phone || '',
+          location: extracted.personal_info?.location || '',
+          bio: extracted.personal_info?.bio || extracted.professional_summary || '',
+          experience: expYears,
+          technical_skills: extractedTech,
+          soft_skills: extractedSoft,
+          linkedinUrl: extracted.social_links?.linkedin_url || imported.candidate_profile?.social_links?.linkedin_url || '',
+          githubUrl: extracted.social_links?.github_url || imported.candidate_profile?.social_links?.github_url || '',
+          portfolioUrl: extracted.social_links?.portfolio_url || imported.candidate_profile?.social_links?.portfolio_url || '',
+        };
+      } else {
+        // Fallback: call analyze-cv when no structured extraction was returned
+        const analysisData = new FormData();
+        analysisData.append('job_title', selectedJob?.title || 'General Candidate Profile');
+        analysisData.append('job_skills', jobSkills);
+        analysisData.append('cv_text', imported.text);
+        analysisData.append('candidate_experience', Number(user.experience || 0));
+        analysisData.append('required_experience', Number(selectedJob?.experience || 0));
+        const analysis = await apiForm('/api/analyze-cv', analysisData);
+        details = analysis.profile_details || {};
+        extractedTech = details.technical_skills || [];
+        extractedSoft = details.soft_skills || [];
+        extractedSkills = analysis.extracted_skills || [...extractedTech, ...extractedSoft];
+        setResult(analysis);
+      }
 
       const newTechSkills = mergeSkills(user.technicalSkills || '', extractedTech);
       const newSoftSkills = mergeSkills(user.softSkills || '', extractedSoft);
       const combinedSkills = mergeSkills(user.skills, [...extractedSkills, ...extractedTech, ...extractedSoft]);
 
       const profileUpdate = {
+        ...(details.name ? { name: details.name } : {}),
         technicalSkills: newTechSkills,
         softSkills: newSoftSkills,
         skills: combinedSkills,
@@ -79,21 +131,31 @@ export default function CandidateDashboard({ jobs = [], user, token, application
         phone: details.phone || user.phone || '',
         location: details.location || user.location || '',
         bio: details.bio || user.bio || '',
-        experience: Math.max(Number(details.experience || 0), Number(user.experience || 0)),
+        experience: details.experience != null && Number(details.experience) > 0
+          ? Number(details.experience)
+          : Math.max(Number(user.experience || 0), 0),
         cvFileName: imported.filename || file.name,
         cvImportedAt: new Date().toISOString(),
+        ...(details.linkedinUrl ? { linkedinUrl: details.linkedinUrl } : {}),
+        ...(details.githubUrl ? { githubUrl: details.githubUrl } : {}),
+        ...(details.portfolioUrl ? { portfolioUrl: details.portfolioUrl } : {}),
       };
       onSaveProfile(profileUpdate);
       setCvText(imported.text); setFileName(imported.filename || file.name);
-      setResult(analysis);
-      
+
       const techCount = extractedTech.length;
       const softCount = extractedSoft.length;
       const totalCount = extractedSkills.length;
-      setMessage(`CV analyzed with Gemini: ${techCount > 0 ? `${techCount} Technical & ${softCount} Soft skills` : `${totalCount} skills`} saved to profile.`);
+      setMessage(`CV parsed with Gemini AI: ${techCount > 0 ? `${techCount} Technical & ${softCount} Soft skills` : `${totalCount} skills`} extracted and profile saved!`);
     } catch (err) { setError(err.message || 'CV processing failed. Please check the backend.'); }
-    finally { setImporting(false); if (fileInputRef.current) fileInputRef.current.value = ''; }
+    finally {
+      setImporting(false);
+      clearInterval(importStepTimer); clearInterval(importElapsedTimer);
+      setImportStep(0); setImportElapsed(0);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
   };
+
 
   const profileText = [
     `Candidate: ${user.name || ''}`,
@@ -105,6 +167,13 @@ export default function CandidateDashboard({ jobs = [], user, token, application
     `Location: ${user.location || ''}`,
   ].join('\n');
 
+  // ---------------------------------------------------------------------------------------
+  // STEP 3: CANDIDATE-TO-JOB AI MATCH EVALUATION
+  // WHY THIS STEP:
+  // - Verifies candidate has registered skills before running AI analysis.
+  // - Calls POST /api/jobs/{id}/candidate-evaluation to run rule-based and AI scoring.
+  // - Calculates match percentage, skill overlaps, missing gaps, and experience fit.
+  // ---------------------------------------------------------------------------------------
   const analyze = async () => {
     if (!selectedJob) { setError('Please select a job first.'); return; }
     if (existingApplication || applied) {
@@ -135,6 +204,13 @@ export default function CandidateDashboard({ jobs = [], user, token, application
     setTimeout(() => applicationsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
   };
 
+  // ---------------------------------------------------------------------------------------
+  // STEP 4: JOB APPLICATION SUBMISSION & PROFILE SNAPSHOT
+  // WHY THIS STEP:
+  // - Submits application to MongoDB with candidate's immutable profile snapshot at apply time.
+  // - Stores match score breakdown so recruiters can view why candidate was ranked high/low.
+  // - Updates UI state to 'Applied' and scrolls to the applications tracker.
+  // ---------------------------------------------------------------------------------------
   const confirmApplication = async () => {
     if (!selectedJob || !result || existingApplication) return;
     setLoading(true); setError('');
@@ -147,7 +223,7 @@ export default function CandidateDashboard({ jobs = [], user, token, application
         candidateSnapshot: { name: user.name || '', headline: user.headline || '', phone: user.phone || '', location: user.location || '',
           skills: [user.technicalSkills, user.softSkills].filter(Boolean).join(', '), technicalSkills: user.technicalSkills || '',
           softSkills: user.softSkills || '', experience: Number(user.experience || 0), cvFileName: fileName || user.cvFileName || '',
-          portfolioUrl: user.portfolioUrl || '' },
+          portfolioUrl: user.portfolioUrl || '', linkedinUrl: user.linkedinUrl || '' },
       });
       setApplied(true);
       setTimeout(() => applicationsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
@@ -217,8 +293,17 @@ export default function CandidateDashboard({ jobs = [], user, token, application
       {selectedJob?.description&&<p className="mt-4 text-sm leading-6 text-slate-600">{selectedJob.description}</p>}
       <div className="my-6"><h3 className="mb-2 text-sm font-semibold">Required Skills</h3><div className="flex flex-wrap gap-2">{jobSkills.split(',').map((skill)=><span key={skill} className="rounded-full bg-slate-100 px-2 py-1 text-xs">{skill.trim()}</span>)}</div></div>
       <div className="border-t pt-6"><div className="mb-2 flex items-center justify-between"><label className="text-sm font-semibold">CV upload <span className="font-normal text-slate-400">(optional)</span></label><span className="text-xs text-slate-400">Profile is used without a CV</span></div>
-        <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt" className="hidden" onChange={(e)=>handleImport(e.target.files?.[0])}/>
-        <button type="button" disabled={importing} onClick={()=>fileInputRef.current?.click()} onDragOver={(e)=>e.preventDefault()} onDrop={(e)=>{e.preventDefault();handleImport(e.dataTransfer.files?.[0]);}} className="w-full rounded-xl border-2 border-dashed border-blue-200 bg-blue-50/60 p-6 disabled:opacity-60">{importing?<Loader2 className="mx-auto mb-2 animate-spin text-blue-600"/>:<Upload className="mx-auto mb-2 text-blue-600"/>}<p className="text-sm font-bold">{importing?'Gemini AI is analyzing & extracting skills...':'Drop CV or click to browse'}</p><p className="mt-1 text-xs text-slate-500">PDF, DOCX or TXT · Max 10 MB</p></button>
+        <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt,.jpg,.jpeg,.png,.webp" className="hidden" onChange={(e)=>handleImport(e.target.files?.[0])}/>
+        <button type="button" disabled={importing} onClick={()=>fileInputRef.current?.click()} onDragOver={(e)=>e.preventDefault()} onDrop={(e)=>{e.preventDefault();handleImport(e.dataTransfer.files?.[0]);}} className="w-full rounded-xl border-2 border-dashed border-blue-200 bg-blue-50/60 p-6 disabled:opacity-60">{importing?<Loader2 className="mx-auto mb-2 animate-spin text-blue-600"/>:<Upload className="mx-auto mb-2 text-blue-600"/>}
+        {importing ? (
+          <>
+            <p className="text-sm font-bold">{['Reading CV document…','Gemini AI extracting skills & experience…','Extracting languages, certifications & projects…','Building your profile — almost done…'][importStep]}</p>
+            <p className="mt-1 text-xs text-blue-500 font-medium">⏱ {importElapsed}s · Usually 15–30 seconds</p>
+          </>
+        ) : (
+          <p className="text-sm font-bold">Drop CV or click to browse</p>
+        )}
+        <p className="mt-1 text-xs text-slate-500">PDF, DOCX, TXT or image · Max 10 MB</p></button>
         {fileName&&<div className="mt-3 flex items-center gap-2 rounded-lg bg-green-50 p-3 text-sm text-green-800"><FileText size={18}/><span className="flex-1 truncate font-semibold">{fileName}</span><button onClick={()=>{setFileName('');setCvText('');setResult(null);}}><X size={16}/></button></div>}
         {message&&<p className="mt-3 flex items-center gap-2 text-sm font-semibold text-green-600"><CheckCircle size={17}/>{message}</p>}{error&&<p role="alert" className="mt-3 rounded-lg bg-red-50 p-3 text-sm font-medium text-red-700">{error}</p>}
 
@@ -283,11 +368,9 @@ export default function CandidateDashboard({ jobs = [], user, token, application
     {hasProfileSkills && result && !existingApplication && !applied ? <div className="relative overflow-hidden rounded-xl border bg-white p-6 shadow-sm">
       <div className="absolute inset-x-0 top-0 h-1 bg-blue-600"/>
       <h3 className="mb-6 flex items-center gap-2 text-lg font-bold"><span className="rounded-lg bg-blue-100 p-1.5 text-blue-700"><Target size={18}/></span>Compatibility Analysis</h3>
-      <div className="mb-6 flex items-center gap-4"><div className={`flex h-16 w-16 items-center justify-center rounded-full border-4 ${result.score>=80?'border-green-500 text-green-600':result.score>=50?'border-orange-500 text-orange-600':'border-red-500 text-red-600'}`}><b>{result.score}%</b></div><div><p className="font-bold">{result.match_level||(result.score>=80?'Strong Match':result.score>=50?'Moderate Match':'Low Match')}</p><p className="text-sm text-slate-500">Complete database profile matched against this job</p><p className="mt-1 text-xs font-semibold text-emerald-700">Evidence confidence: {result.evidence_confidence??0}%</p></div></div>
-      {result.score_breakdown?.technical_skills ? <div className="mb-5 grid items-start gap-2 sm:grid-cols-2">{Object.entries(result.score_breakdown).map(([key,item])=><CategoryScoreCard key={key} category={key} item={item} evidenceConfidence={result.evidence_confidence}/>)}</div> : result.score_breakdown && <div className="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-4"><p className="text-xs font-bold uppercase text-slate-500">Legacy score</p></div>}
-      {result.skill_analysis?.length>0&&<div className="mb-4 rounded-lg border border-slate-200 bg-white p-4"><p className="mb-2 text-xs font-bold uppercase text-slate-500">Important skill analysis</p>{result.skill_analysis.map((item)=><div key={item.skill} className="border-t border-slate-100 py-2 first:border-0"><div className="flex justify-between gap-3 text-xs"><span className="font-bold text-slate-800">{item.skill} · {item.candidate_match?.replaceAll('_',' ')}</span><span className="font-semibold text-blue-700">{item.score_percentage}%</span></div><p className="mt-1 text-xs text-slate-500">{item.explanation}</p></div>)}</div>}
+      <div className="mb-6 flex items-center gap-4"><div className={`flex h-16 w-16 items-center justify-center rounded-full border-4 ${result.score>=80?'border-green-500 text-green-600':result.score>=50?'border-orange-500 text-orange-600':'border-red-500 text-red-600'}`}><b>{result.score}%</b></div><div><p className="font-bold">{result.match_level||(result.score>=80?'Strong Match':result.score>=50?'Moderate Match':'Low Match')}</p><p className="text-sm text-slate-500">Final compatibility score for this job</p></div></div>
+      <CandidateImprovementSuggestions analysis={result}/>
       <ResultBox title="Strongest Matches" text={result.strongest_matches?.join(', ')||'No strong match evidence identified'} color="green"/>
-      <ResultBox title="Skill Gaps" text={result.skill_gaps?.join(', ')||'No confirmed skill gaps'} color="red"/>
       <ResultBox title="Recommendation" text={result.recommendation?.reason||'Manual review recommended'} color="blue"/>
       <button onClick={confirmApplication} disabled={existingApplication||applied} className="mt-6 flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 py-3 font-bold text-white hover:bg-slate-800 disabled:bg-green-600"><CheckCircle size={18}/>{existingApplication||applied?'Application submitted':'Confirm Application'}</button>
     </div> : !hasProfileSkills && !existingApplication && !applied ? (
@@ -413,38 +496,83 @@ export default function CandidateDashboard({ jobs = [], user, token, application
 
 function ResultBox({ title, text, color }) { const style={green:'border-green-100 bg-green-50 text-green-800',red:'border-red-100 bg-red-50 text-red-800',blue:'border-blue-100 bg-blue-50 text-blue-900'}; return <div className={`mb-3 rounded-lg border p-4 ${style[color]}`}><h4 className="mb-2 text-xs font-bold uppercase">{title === 'AI Suggestion' ? 'Career Guidance' : title}</h4><p className="text-sm leading-6">{text}</p></div>; }
 
-function SkillScoreDetails({ skills }) {
-  const statusStyle = { Full: 'bg-green-50 text-green-700', Partial: 'bg-amber-50 text-amber-700', Missing: 'bg-red-50 text-red-700' };
-  return <div className="mb-4 overflow-hidden rounded-lg border border-slate-200"><div className="border-b border-slate-200 bg-white px-4 py-3"><h4 className="text-xs font-bold uppercase text-slate-600">Skill Score Details</h4></div><div className="divide-y divide-slate-100">{skills.map((item)=><div key={item.skill} className="grid gap-2 px-4 py-3 sm:grid-cols-[minmax(110px,0.7fr)_90px_1fr_auto] sm:items-center"><span className="text-sm font-bold text-slate-900">{item.skill}</span><span className={`w-fit rounded-full px-2 py-1 text-[11px] font-bold ${statusStyle[item.status]}`}>{item.status}</span><span className="text-xs leading-5 text-slate-500">{item.evidence}</span><span className="text-sm font-bold tabular-nums text-slate-700">{item.points}/{item.max_points}</span></div>)}</div></div>;
+const IMPROVEMENT_LABELS = {
+  technical_skills: 'Technical skills',
+  experience: 'Experience',
+  projects: 'Projects',
+  education: 'Education',
+  certifications: 'Certifications',
+  github_evidence: 'GitHub evidence',
+  job_relevance: 'Job relevance',
+  technical_assessment: 'Technical assessment',
+  structured_interview: 'Structured interview',
+};
+
+const IMPROVEMENT_TIPS = {
+  technical_skills: 'Add role-relevant skills and show where you used each one.',
+  experience: 'Describe responsibilities, duration, measurable outcomes, and technologies used.',
+  projects: 'Add relevant projects with your contribution, technologies, outcomes, and working links.',
+  education: 'Complete the qualification, institution, field, dates, and grade where available.',
+  certifications: 'Add relevant certifications with issuer, credential link, and skills covered.',
+  github_evidence: 'Verify your GitHub profile and keep relevant repositories documented and public.',
+  job_relevance: 'Tailor your profile evidence to the role requirements and use concrete examples.',
+  technical_assessment: 'Complete the technical assessment and review the role-specific topics.',
+  structured_interview: 'Prepare concise examples that explain your decisions, contribution, and results.',
+};
+
+function getCandidateImprovements(analysis = {}) {
+  const improvements = [];
+  const seen = new Set();
+  const add = (area, suggestion) => {
+    const clean = String(suggestion || '').trim();
+    const key = `${area}:${clean}`.toLowerCase();
+    if (clean && !seen.has(key)) {
+      seen.add(key);
+      improvements.push({ area, suggestion: clean });
+    }
+  };
+
+  (analysis.skill_gaps || []).forEach((skill) => add(
+    'Skills',
+    `Build practical evidence for ${skill}, then add the project, certification, or work example to your profile.`,
+  ));
+
+  const skillDetails = analysis.skill_analysis || analysis.skill_breakdown || [];
+  skillDetails
+    .filter((item) => ['partial', 'missing'].includes(String(item.candidate_match || item.status || '').toLowerCase()))
+    .forEach((item) => add(
+      item.skill || 'Skills',
+      item.explanation || item.evidence || `Add clear evidence showing how you have used ${item.skill}.`,
+    ));
+
+  Object.entries(analysis.score_breakdown || {}).forEach(([category, item = {}]) => {
+    const score = Number(item.score ?? item.weighted_score ?? 0);
+    const maximum = Number(item.max ?? item.maximum_score ?? 0);
+    if (maximum > 0 && score < maximum) {
+      const area = IMPROVEMENT_LABELS[category] || category.replaceAll('_', ' ');
+      const missing = Array.isArray(item.missing_evidence) ? item.missing_evidence.filter(Boolean) : [];
+      add(area, missing.length ? `Add evidence for ${missing.join(', ')}.` : IMPROVEMENT_TIPS[category]);
+    }
+  });
+
+  if (!improvements.length) {
+    add('Profile evidence', 'Keep your projects, experience, certifications, and verified links current for future applications.');
+  }
+  return improvements.slice(0, 6);
 }
 
-function CategoryScoreCard({ category, item = {}, evidenceConfidence }) {
-  const [expanded, setExpanded] = useState(false);
-  const score = Number(item.score ?? item.weighted_score ?? 0);
-  const maximum = Number(item.max ?? item.maximum_score ?? 0);
-  const percentage = maximum > 0 ? Math.round((score / maximum) * 1000) / 10 : 0;
-  const evidence = Array.isArray(item.evidence) ? item.evidence.filter(Boolean) : [];
-  return <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
-    <div className="flex items-center justify-between gap-3"><span className="text-xs font-bold capitalize text-slate-700">{category.replaceAll('_',' ')}</span><span className="text-sm font-bold text-blue-700">{score}/{maximum}</span></div>
-    <p className="mt-1 text-xs leading-5 text-slate-500">{item.reason || 'No scoring explanation was recorded.'}</p>
-    <button type="button" onClick={() => setExpanded((value) => !value)} className="mt-2 text-xs font-bold text-blue-600 hover:text-blue-800 hover:underline">{expanded ? 'Hide calculation' : 'How was this calculated?'}</button>
-    {expanded && <div className="mt-3 space-y-2 rounded-lg border border-blue-100 bg-blue-50/60 p-3 text-xs leading-5 text-slate-700">
-      <p><strong>Formula:</strong> {score} awarded ÷ {maximum} maximum × 100 = <strong>{percentage}%</strong> category achievement.</p>
-      <p><strong>Weight:</strong> This category contributes a maximum of {maximum} marks to the 100-mark job-match score.</p>
-      <p><strong>Assessment:</strong> {item.reason || 'No relevant evidence was identified.'}</p>
-      {evidenceConfidence != null && <p><strong>Overall evidence confidence:</strong> {evidenceConfidence}%. This is shown separately and is not added to the marks.</p>}
-      {evidence.length > 0 ? <div><strong>Evidence used:</strong><ul className="mt-1 list-disc pl-5">{evidence.map((value, index) => <li key={index}>{typeof value === 'string' ? value : JSON.stringify(value)}</li>)}</ul></div> : <p className="text-slate-500"><strong>Evidence detail:</strong> The recorded reason summarizes the database evidence used. Missing external verification is not automatically treated as failure.</p>}
-    </div>}
-  </div>;
+function CandidateImprovementSuggestions({ analysis }) {
+  const improvements = getCandidateImprovements(analysis);
+  return <section className="mb-4 rounded-lg border border-amber-200 bg-amber-50/60 p-4">
+    <h4 className="text-xs font-bold uppercase text-amber-900">How to improve</h4>
+    <div className="mt-3 space-y-3">{improvements.map((item, index) => <div key={`${item.area}-${index}`} className="flex gap-3 text-sm leading-6 text-slate-700"><CheckCircle className="mt-1 shrink-0 text-amber-600" size={16}/><p><strong className="text-slate-900">{item.area}:</strong> {item.suggestion}</p></div>)}</div>
+  </section>;
 }
 
 function ApplicationReview({ application }) {
   const analysis = application.enterpriseEvaluation || application.analysis || {};
   const profile = application.candidateSnapshot || {};
-  const breakdown = analysis.score_breakdown;
-  const skills = analysis.skill_breakdown || [];
-  const categories = breakdown && breakdown.technical_skills ? Object.entries(breakdown) : [];
-  return <div className="border-t border-slate-200 bg-slate-50 px-5 py-5"><h3 className="mb-5 flex items-center gap-2 text-lg font-bold text-slate-900"><span className="rounded-lg bg-blue-100 p-1.5 text-blue-700"><Target size={18}/></span>Compatibility Analysis</h3><div className="grid gap-6 lg:grid-cols-[0.8fr_1.2fr]"><div><h4 className="text-xs font-bold uppercase text-slate-500">Submitted Profile</h4><dl className="mt-3 grid gap-3 text-sm"><div><dt className="text-xs text-slate-400">Candidate</dt><dd className="font-semibold text-slate-800">{profile.name||'Not recorded'}</dd></div><div><dt className="text-xs text-slate-400">Headline</dt><dd className="font-semibold text-slate-800">{profile.headline||'Not provided'}</dd></div><div><dt className="text-xs text-slate-400">Experience</dt><dd className="font-semibold text-slate-800">{application.candidateExperience??profile.experience??0} years / {application.requiredExperience??0} required</dd></div><div><dt className="text-xs text-slate-400">CV</dt><dd className="font-semibold text-slate-800">{profile.cvFileName||'Profile application'}</dd></div></dl></div><div><h4 className="text-xs font-bold uppercase text-slate-500">Application Score</h4><div className="mt-3 flex flex-wrap items-center gap-2 text-sm font-bold"><span className="rounded-lg bg-blue-600 px-3 py-2 text-white">{application.overallScore??application.score}% total</span>{analysis.evidence_confidence!=null&&<span className="rounded-lg bg-emerald-50 px-3 py-2 text-emerald-700">Evidence confidence {analysis.evidence_confidence}%</span>}</div>{categories.length>0?<div className="mt-4 grid items-start gap-2 sm:grid-cols-2">{categories.map(([key,item])=><CategoryScoreCard key={key} category={key} item={item} evidenceConfidence={analysis.evidence_confidence}/>)}</div>:skills.length>0?<div className="mt-4"><SkillScoreDetails skills={skills}/></div>:<p className="mt-4 text-sm text-slate-500">Detailed category scoring was not saved for this earlier application.</p>}</div></div><div className="mt-5 border-t border-slate-200 pt-5"><h4 className="text-xs font-bold uppercase text-blue-700">Recommendation</h4><p className="mt-2 text-sm leading-6 text-slate-700">{analysis.recommendation?.reason||analysis.ai_suggestion||'Manual recruiter review is recommended where evidence is incomplete.'}</p></div></div>;
+  return <div className="border-t border-slate-200 bg-slate-50 px-5 py-5"><h3 className="mb-5 flex items-center gap-2 text-lg font-bold text-slate-900"><span className="rounded-lg bg-blue-100 p-1.5 text-blue-700"><Target size={18}/></span>Compatibility Analysis</h3><div className="grid gap-6 lg:grid-cols-[0.8fr_1.2fr]"><div><h4 className="text-xs font-bold uppercase text-slate-500">Submitted Profile</h4><dl className="mt-3 grid gap-3 text-sm"><div><dt className="text-xs text-slate-400">Candidate</dt><dd className="font-semibold text-slate-800">{profile.name||'Not recorded'}</dd></div><div><dt className="text-xs text-slate-400">Headline</dt><dd className="font-semibold text-slate-800">{profile.headline||'Not provided'}</dd></div><div><dt className="text-xs text-slate-400">Experience</dt><dd className="font-semibold text-slate-800">{application.candidateExperience??profile.experience??0} years / {application.requiredExperience??0} required</dd></div><div><dt className="text-xs text-slate-400">CV</dt><dd className="font-semibold text-slate-800">{profile.cvFileName||'Profile application'}</dd></div></dl></div><div><h4 className="text-xs font-bold uppercase text-slate-500">Final Score</h4><div className="mt-3 text-sm font-bold"><span className="rounded-lg bg-blue-600 px-3 py-2 text-white">{application.overallScore??application.score}% total</span></div><div className="mt-5"><CandidateImprovementSuggestions analysis={analysis}/></div></div></div><div className="mt-5 border-t border-slate-200 pt-5"><h4 className="text-xs font-bold uppercase text-blue-700">Recommendation</h4><p className="mt-2 text-sm leading-6 text-slate-700">{analysis.recommendation?.reason||analysis.ai_suggestion||'Keep your profile evidence current and tailor it to the role requirements.'}</p></div></div>;
 }
 
 function ApplicationStatus({ applications, jobs, onWithdraw }) {

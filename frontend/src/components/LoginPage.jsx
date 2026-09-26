@@ -1,8 +1,23 @@
+// =========================================================================================
+// FILE: LoginPage.jsx
+// PURPOSE: Handles user authentication (Login and Registration) for both Candidates and Recruiters.
+// =========================================================================================
+
 import React, { useState } from 'react';
 import { ArrowLeft, ArrowRight, Briefcase, Eye, EyeOff, ShieldCheck, Sparkles, User } from 'lucide-react';
 import BrandLogo from './BrandLogo';
 
 export default function LoginPage({ onLogin, initialError = '', initialMode = 'login', onBack }) {
+  // ---------------------------------------------------------------------------------------
+  // STEP 1: COMPONENT STATE INITIALIZATION
+  // WHY THIS STEP:
+  // - 'mode': Tracks whether the user is viewing the 'login' or 'register' form.
+  // - 'role': Differentiates between 'candidate' and 'recruiter' for tailored registration fields.
+  // - 'name', 'email', 'password', 'company', 'location': Form input bindings (controlled inputs).
+  // - 'showPassword': Toggles password visibility (text vs. password) for UX convenience.
+  // - 'error': Holds user-facing validation errors or backend rejection messages.
+  // - 'submitting': Prevents duplicate clicks by disabling the submit button during API calls.
+  // ---------------------------------------------------------------------------------------
   const [mode, setMode] = useState(initialMode);
   const [role, setRole] = useState('candidate');
   const [name, setName] = useState('');
@@ -14,30 +29,46 @@ export default function LoginPage({ onLogin, initialError = '', initialMode = 'l
   const [error, setError] = useState(initialError);
   const [submitting, setSubmitting] = useState(false);
 
+  // ---------------------------------------------------------------------------------------
+  // STEP 2: FORM SUBMISSION & CLIENT-SIDE VALIDATION HANDLER
+  // WHY THIS STEP:
+  // - Intercepts standard HTML form submit to prevent page reload.
+  // - Validates required inputs before making a network call, saving backend server bandwidth.
+  // - Checks email syntax using a standard regular expression.
+  // - Ensures minimum password complexity (>= 6 characters).
+  // - Bundles the credentials into a structured payload and sends it to the parent onLogin handler.
+  // ---------------------------------------------------------------------------------------
   const handleSubmit = async (event) => {
+    // Prevent default browser form submission (prevents page refresh)
     event.preventDefault();
     setError('');
 
+    // Check 2.1: Required fields check based on mode and role
     if ((mode === 'register' && (!name.trim() || (role === 'recruiter' && (!company.trim() || !location.trim())))) || !email.trim() || !password) {
       setError('Please complete all required fields.');
       return;
     }
 
+    // Check 2.2: Standard email format regex check
     if (!/^\S+@\S+\.\S+$/.test(email)) {
       setError('Please enter a valid email address.');
       return;
     }
 
+    // Check 2.3: Password length check for basic security
     if (password.length < 6) {
       setError('Password must contain at least 6 characters.');
       return;
     }
 
+    // Step 2.4: Set loading state and construct payload
     setSubmitting(true);
     const credentials = { mode, email: email.trim().toLowerCase(), password };
     if (mode === 'register') {
       Object.assign(credentials, { role, name: name.trim(), company: company.trim(), location: location.trim() });
     }
+
+    // Step 2.5: Delegate API call to App.jsx onLogin handler
     const result = await onLogin(credentials);
     if (result?.error) setError(result.error);
     setSubmitting(false);

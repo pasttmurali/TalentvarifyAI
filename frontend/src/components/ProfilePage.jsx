@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
+  Award,
   ArrowRight,
   Building2,
   CheckCircle,
@@ -53,10 +54,12 @@ export default function ProfilePage({ user, token, onSave }) {
   });
   const [saved, setSaved] = useState(false);
   const [cvImporting, setCvImporting] = useState(false);
+  const [cvImportStep, setCvImportStep] = useState(0);
+  const [cvImportElapsed, setCvImportElapsed] = useState(0);
   const [cvMessage, setCvMessage] = useState('');
   const [cvError, setCvError] = useState('');
   const [githubEvidence, setGithubEvidence] = useState(null);
-  const [structured, setStructured] = useState({ languages: [], projects: [], education: [], cv_analyses: [] });
+  const [structured, setStructured] = useState({ languages: [], projects: [], certifications: [], education: [] });
   const [skillMatrix, setSkillMatrix] = useState([]);
   const [showSkillMatrixDetails, setShowSkillMatrixDetails] = useState(false);
   const [showAllSkillMatrix, setShowAllSkillMatrix] = useState(false);
@@ -73,6 +76,7 @@ export default function ProfilePage({ user, token, onSave }) {
   const [selectedSkillDrillDown, setSelectedSkillDrillDown] = useState(null);
   const [showHistoryModal, setShowHistoryModal] = useState(false);
   const [showCompareModal, setShowCompareModal] = useState(false);
+  const [resettingProfile, setResettingProfile] = useState(false);
   const [snapshots, setSnapshots] = useState([]);
   const [compareData, setCompareData] = useState(null);
   const [compareFromId, setCompareFromId] = useState('');
@@ -128,6 +132,7 @@ export default function ProfilePage({ user, token, onSave }) {
   };
 
   useEffect(() => {
+    setCvError('');
     loadData();
   }, [token, user.role]);
 
@@ -268,8 +273,8 @@ export default function ProfilePage({ user, token, onSave }) {
   const handleCvImport = async (file) => {
     if (!file) return;
     const extension = file.name.split('.').pop()?.toLowerCase();
-    if (!['pdf', 'docx', 'txt'].includes(extension)) {
-      setCvError('Please choose a PDF, DOCX, or TXT file.');
+    if (!['pdf', 'docx', 'txt', 'jpg', 'jpeg', 'png', 'webp'].includes(extension)) {
+      setCvError('Please choose a PDF, DOCX, TXT, JPG, PNG, or WebP file.');
       return;
     }
     if (file.size > 10 * 1024 * 1024) {
@@ -279,24 +284,39 @@ export default function ProfilePage({ user, token, onSave }) {
     setCvImporting(true);
     setCvError('');
     setCvMessage('');
+    setCvImportStep(0);
+    setCvImportElapsed(0);
+    const stepMessages = [
+      'Reading CV document…',
+      'Gemini AI is extracting skills & experience…',
+      'Extracting languages, certifications & projects…',
+      'Building your profile — almost done…',
+    ];
+    const stepTimer = setInterval(() => setCvImportStep((s) => (s + 1) % stepMessages.length), 4000);
+    const elapsedTimer = setInterval(() => setCvImportElapsed((e) => e + 1), 1000);
     try {
       const uploadData = new FormData();
       uploadData.append('file', file);
       const imported = await apiForm(`/api/import-cv?token=${encodeURIComponent(token)}`, uploadData);
 
-      let details, extractedTech, extractedSoft, extractedSkills;
+      let details, extractedTech, extractedSoft, extractedSkills, linkedinLink, githubLink, portfolioLink;
       if (imported.structured_extraction) {
         const extracted = imported.structured_extraction;
-        extractedTech = (extracted.technical_skills || []).map((item) => item.skill);
-        extractedSoft = (extracted.soft_skills || []).map((item) => item.skill);
+        extractedTech = (extracted.technical_skills || []).map((item) => (typeof item === 'object' ? item.skill : item)).filter(Boolean);
+        extractedSoft = (extracted.soft_skills || []).map((item) => (typeof item === 'object' ? item.skill : item)).filter(Boolean);
         extractedSkills = [...extractedTech, ...extractedSoft];
         const months = (extracted.experience || []).reduce((sum, item) => sum + Number(item.duration_months || 0), 0);
+        const expYears = extracted.personal_info?.experience_years != null ? Number(extracted.personal_info.experience_years) : (months ? Math.round((months / 12) * 10) / 10 : 0);
+        linkedinLink = extracted.personal_info?.linkedin_url || imported.candidate_profile?.social_links?.linkedin_url || '';
+        githubLink = extracted.github?.profile_url || imported.candidate_profile?.social_links?.github_url || '';
+        portfolioLink = extracted.personal_info?.portfolio_url || imported.candidate_profile?.social_links?.portfolio_url || '';
+
         details = {
-          headline: extracted.personal_info?.professional_title || '',
+          headline: extracted.personal_info?.headline || extracted.personal_info?.professional_title || '',
           phone: extracted.personal_info?.phone || '',
           location: extracted.personal_info?.location || '',
-          bio: '',
-          experience: months / 12,
+          bio: extracted.personal_info?.bio || extracted.professional_summary || '',
+          experience: expYears,
           technical_skills: extractedTech,
           soft_skills: extractedSoft,
         };
@@ -322,10 +342,10 @@ export default function ProfilePage({ user, token, onSave }) {
       const newPhone = details.phone || form.phone || '';
       const newLocation = details.location || form.location || '';
       const newBio = details.bio || form.bio || '';
-      const newExperience = Math.max(Number(details.experience || 0), Number(form.experience || 0));
+      const newExperience = details.experience != null && details.experience !== '' ? Number(details.experience) : Number(form.experience || 0);
 
       const profileUpdate = {
-        name: form.name,
+        name: imported.structured_extraction?.personal_info?.full_name || form.name,
         company: form.company,
         technicalSkills: newTechSkills,
         softSkills: newSoftSkills,
@@ -337,6 +357,9 @@ export default function ProfilePage({ user, token, onSave }) {
         experience: newExperience,
         cvFileName: imported.filename || file.name,
         cvImportedAt: new Date().toISOString(),
+        ...(linkedinLink ? { linkedinUrl: linkedinLink } : {}),
+        ...(githubLink ? { githubUrl: githubLink } : {}),
+        ...(portfolioLink ? { portfolioUrl: portfolioLink } : {}),
       };
 
       setForm((current) => ({ ...current, ...profileUpdate }));
@@ -353,6 +376,10 @@ export default function ProfilePage({ user, token, onSave }) {
       setCvError(err.message || 'CV processing failed. Please check the backend.');
     } finally {
       setCvImporting(false);
+      clearInterval(stepTimer);
+      clearInterval(elapsedTimer);
+      setCvImportStep(0);
+      setCvImportElapsed(0);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
@@ -371,6 +398,47 @@ export default function ProfilePage({ user, token, onSave }) {
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
     loadData();
+  };
+
+  const resetProfile = async () => {
+    const confirmed = window.confirm('This will clear your saved technical skills, soft skills, profile details, project/certification/language records, and CV imports for your account. Do you want to continue?');
+    if (!confirmed) return;
+    setResettingProfile(true);
+    setCvError('');
+    setCvMessage('');
+    try {
+      await apiRequest(`/api/candidates/me/reset-profile?token=${encodeURIComponent(token)}`, { method: 'POST' });
+      const resetForm = {
+        name: user.name || '',
+        phone: '',
+        location: '',
+        headline: '',
+        company: '',
+        bio: '',
+        technicalSkills: '',
+        softSkills: '',
+        skills: '',
+        experience: '',
+        linkedinUrl: '',
+        githubUrl: '',
+        portfolioUrl: '',
+      };
+      setForm((current) => ({ ...current, ...resetForm }));
+      setStructured({ languages: [], projects: [], certifications: [], education: [] });
+      setSkillMatrix([]);
+      setGithubEvidence(null);
+      setLinkedinVerification(null);
+      setLinkedinHistory([]);
+      setPortfolioEvidence(null);
+      await onSave(resetForm);
+      setCvError('');
+      setCvMessage('Profile reset successfully.');
+    } catch (error) {
+      console.error('Profile reset error:', error);
+      setCvError(error.message || 'Profile reset failed.');
+    } finally {
+      setResettingProfile(false);
+    }
   };
 
   const techBadges = (form.technicalSkills || '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -470,7 +538,7 @@ export default function ProfilePage({ user, token, onSave }) {
             </div>
           </div>
 
-          <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt" className="hidden" onChange={(e) => handleCvImport(e.target.files?.[0])} />
+          <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt,.jpg,.jpeg,.png,.webp" className="hidden" onChange={(e) => handleCvImport(e.target.files?.[0])} />
           <button
             type="button"
             disabled={cvImporting}
@@ -480,8 +548,17 @@ export default function ProfilePage({ user, token, onSave }) {
             className="w-full rounded-xl border-2 border-dashed border-blue-300 bg-blue-50/60 p-6 text-center transition hover:bg-blue-100/50 disabled:opacity-60"
           >
             {cvImporting ? <Loader2 className="mx-auto mb-2 animate-spin text-blue-600" size={24} /> : <Upload className="mx-auto mb-2 text-blue-600" size={24} />}
-            <p className="text-sm font-bold text-slate-800">{cvImporting ? 'Gemini AI is parsing your CV & extracting skills...' : 'Drop CV here or click to browse file'}</p>
-            <p className="mt-1 text-xs text-slate-500">PDF, DOCX or TXT · Max 10 MB</p>
+            {cvImporting ? (
+              <>
+                <p className="text-sm font-bold text-slate-800">
+                  {['Reading CV document…', 'Gemini AI is extracting skills & experience…', 'Extracting languages, certifications & projects…', 'Building your profile — almost done…'][cvImportStep]}
+                </p>
+                <p className="mt-1 text-xs text-blue-500 font-medium">⏱ {cvImportElapsed}s elapsed · Usually 15–30 seconds</p>
+              </>
+            ) : (
+              <p className="text-sm font-bold text-slate-800">Drop CV here or click to browse file</p>
+            )}
+            <p className="mt-1 text-xs text-slate-500">PDF, DOCX, TXT or image · Max 10 MB</p>
           </button>
 
           {cvMessage && (
@@ -906,6 +983,11 @@ export default function ProfilePage({ user, token, onSave }) {
           <button type="submit" className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-3 font-bold text-white shadow-sm hover:bg-blue-700 transition">
             <Save size={18} /> Save Profile
           </button>
+          {user.role === 'candidate' && (
+            <button type="button" onClick={resetProfile} disabled={resettingProfile} className="flex items-center gap-2 rounded-xl border border-red-200 bg-red-50 px-6 py-3 font-bold text-red-700 shadow-sm hover:bg-red-100 disabled:opacity-60 transition">
+              <XCircle size={18} /> {resettingProfile ? 'Resetting...' : 'Reset profile'}
+            </button>
+          )}
           {saved && <span className="text-sm font-semibold text-emerald-600">Profile saved successfully.</span>}
         </div>
       </form>
@@ -1184,19 +1266,33 @@ function EvidenceMetric({ label, value, icon }) {
 function StructuredSections({ data, token, onAdded }) {
   const empty = {
     languages: { language: '', speaking_level: '', reading_level: '', writing_level: '' },
-    projects: { name: '', description: '', technologies: '' },
+    projects: { name: '', description: '', technologies: '', soft_skills: '' },
+    certifications: {
+      name: '',
+      issuer: '',
+      description: '',
+      issue_date: '',
+      expiry_date: '',
+      credential_id: '',
+      credential_url: '',
+      relevant_skills: '',
+    },
     education: { qualification: '', institution: '', field: '', start_year: '', end_year: '', grade: '' },
   };
   const [forms, setForms] = useState(empty);
   const [open, setOpen] = useState('');
   const [error, setError] = useState('');
-  const [expandedLists, setExpandedLists] = useState({ projects: false, cv_analyses: false });
+  const [expandedLists, setExpandedLists] = useState({ projects: false, certifications: false });
   const add = async (section) => {
     setError('');
     try {
       const raw = forms[section];
       const payload = { ...raw };
-      if (section === 'projects') payload.technologies = raw.technologies.split(',').map((item) => item.trim()).filter(Boolean);
+      if (section === 'projects') {
+        payload.technologies = raw.technologies.split(',').map((item) => item.trim()).filter(Boolean);
+        payload.soft_skills = raw.soft_skills ? raw.soft_skills.split(',').map((item) => item.trim()).filter(Boolean) : [];
+      }
+      if (section === 'certifications') payload.relevant_skills = raw.relevant_skills.split(',').map((item) => item.trim()).filter(Boolean);
       if (section === 'education') {
         payload.start_year = raw.start_year ? Number(raw.start_year) : null;
         payload.end_year = raw.end_year ? Number(raw.end_year) : null;
@@ -1237,9 +1333,50 @@ function StructuredSections({ data, token, onAdded }) {
       empty: 'No projects extracted yet.',
       render: (item) => (
         <>
-          <b>{item.name}</b>
-          <span>{item.description || item.candidate_contribution || 'No description provided'}</span>
-          <small>{(item.technologies || []).join(', ')}</small>
+          <b className="break-words [overflow-wrap:anywhere]">{item.name}</b>
+          <span className="break-words [overflow-wrap:anywhere]">{item.description || item.candidate_contribution || 'No description provided'}</span>
+          {Array.isArray(item.soft_skills) && item.soft_skills.length > 0 && (
+            <small className="break-words [overflow-wrap:anywhere]">Soft skills: {item.soft_skills.join(', ')}</small>
+          )}
+          <small className="break-words [overflow-wrap:anywhere]">{(item.technologies || []).join(', ')}</small>
+        </>
+      ),
+    },
+    {
+      key: 'certifications',
+      title: 'Certifications',
+      icon: <Award size={18} />,
+      empty: 'No certifications extracted yet.',
+      render: (item) => (
+        <>
+          <b className="break-words [overflow-wrap:anywhere]">{item.name}</b>
+          <span className="break-words [overflow-wrap:anywhere]">
+            {[
+              item.issuer,
+              item.issue_date && `Issued: ${item.issue_date}`,
+              item.expiry_date && `Expires: ${item.expiry_date}`,
+            ].filter(Boolean).join(' | ') || 'Issuer not provided'}
+          </span>
+          {item.description && <span className="break-words [overflow-wrap:anywhere]">{item.description}</span>}
+          {Array.isArray(item.relevant_skills) && item.relevant_skills.length > 0 && (
+            <small className="break-words [overflow-wrap:anywhere]">Skills: {item.relevant_skills.join(', ')}</small>
+          )}
+          {item.credential_id && <small className="break-words [overflow-wrap:anywhere]">Credential ID: {item.credential_id}</small>}
+          {item.credential_url && (() => {
+            const rawUrl = item.credential_url.trim();
+            const href = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+            return (
+              <a
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                className="mt-1 inline-flex items-center gap-1 self-start break-all font-semibold text-blue-700 hover:underline"
+              >
+                <ExternalLink size={13} /> View credential
+              </a>
+            );
+          })()}
+
         </>
       ),
     },
@@ -1258,22 +1395,6 @@ function StructuredSections({ data, token, onAdded }) {
         </>
       ),
     },
-    {
-      key: 'cv_analyses',
-      title: 'CV analyses',
-      icon: <History size={18} />,
-      empty: 'No CV analysis history yet.',
-      render: (item) => (
-        <>
-          <b>{item.file_name}</b>
-          <span className="capitalize">{String(item.parsing_status || 'pending').replace('_', ' ')}</span>
-          <small>
-            {item.parser_model || item.parser || 'Local extraction'}
-            {item.parsed_at ? ` · ${new Date(item.parsed_at).toLocaleDateString()}` : ''}
-          </small>
-        </>
-      ),
-    },
   ];
   return (
     <div className="grid gap-4 md:grid-cols-2">
@@ -1284,26 +1405,16 @@ function StructuredSections({ data, token, onAdded }) {
               {section.icon}
               {section.title}
             </h4>
-            {section.key === 'cv_analyses' ? (
-              <button
-                type="button"
-                onClick={() => setExpandedLists((current) => ({ ...current, cv_analyses: !current.cv_analyses }))}
-                className="rounded-lg border border-indigo-200 px-3 py-1 text-xs font-bold text-indigo-700"
-              >
-                {expandedLists.cv_analyses ? 'Hide history' : `View history (${(data?.cv_analyses || []).length})`}
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  setError('');
-                  setOpen(open === section.key ? '' : section.key);
-                }}
-                className="rounded-lg border border-blue-200 px-3 py-1 text-xs font-bold text-blue-700"
-              >
-                {open === section.key ? 'Cancel' : '+ Add manually'}
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => {
+                setError('');
+                setOpen(open === section.key ? '' : section.key);
+              }}
+              className="rounded-lg border border-blue-200 px-3 py-1 text-xs font-bold text-blue-700"
+            >
+              {open === section.key ? 'Cancel' : '+ Add manually'}
+            </button>
           </div>
           {open === section.key && (
             <ManualRecordForm
@@ -1315,13 +1426,13 @@ function StructuredSections({ data, token, onAdded }) {
             />
           )}
           <div className="mt-3 space-y-2">
-            {section.key === 'cv_analyses' && !expandedLists.cv_analyses ? (
-              <p className="text-sm text-slate-400">CV analysis records are hidden. Click “View history” to inspect them.</p>
-            ) : (data?.[section.key] || []).length ? (
-              (section.key === 'projects' && !expandedLists.projects ? data[section.key].slice(0, 2) : data[section.key]).map((item, index) => (
-                <div key={item.id || index} className="flex flex-col rounded-lg bg-slate-50 p-3 text-sm text-slate-600 ring-1 ring-slate-100">
+            {(data?.[section.key] || []).length ? (
+              (section.key === 'projects' && !expandedLists.projects ? data[section.key].slice(0, 2)
+                : section.key === 'certifications' && !expandedLists.certifications ? data[section.key].slice(0, 2)
+                : data[section.key]).map((item, index) => (
+                <div key={item.id || index} className="flex min-w-0 flex-col rounded-lg bg-slate-50 p-3 text-sm text-slate-600 ring-1 ring-slate-100">
                   {section.render(item)}
-                  <small className="mt-1 text-blue-600">
+                  <small className="mt-1 break-words text-blue-600 [overflow-wrap:anywhere]">
                     {(item.sources || [item.source])
                       .filter(Boolean)
                       .map((source) => (source === 'cv_gemini' ? 'CV · Gemini' : source === 'candidate_manual' ? 'Manual' : source))
@@ -1335,6 +1446,11 @@ function StructuredSections({ data, token, onAdded }) {
             {section.key === 'projects' && (data?.projects || []).length > 2 && (
               <button type="button" onClick={() => setExpandedLists((current) => ({ ...current, projects: !current.projects }))} className="w-full rounded-lg border border-blue-200 py-2 text-sm font-bold text-blue-700 hover:bg-blue-50">
                 {expandedLists.projects ? 'Show less' : `See more (${data.projects.length - 2})`}
+              </button>
+            )}
+            {section.key === 'certifications' && (data?.certifications || []).length > 2 && (
+              <button type="button" onClick={() => setExpandedLists((current) => ({ ...current, certifications: !current.certifications }))} className="w-full rounded-lg border border-blue-200 py-2 text-sm font-bold text-blue-700 hover:bg-blue-50">
+                {expandedLists.certifications ? 'Show less' : `See more (${data.certifications.length - 2})`}
               </button>
             )}
           </div>
@@ -1353,7 +1469,7 @@ function ManualRecordForm({ section, value, setValue, onSave, error }) {
       value={value[name] ?? ''}
       onChange={(e) => setValue({ ...value, [name]: e.target.value })}
       placeholder={placeholder}
-      className="rounded-lg border border-slate-300 bg-white p-2 text-sm"
+      className="min-w-0 w-full rounded-lg border border-slate-300 bg-white p-2 text-sm"
     />
   );
   const select = (name, label, options) => (
@@ -1387,6 +1503,21 @@ function ManualRecordForm({ section, value, setValue, onSave, error }) {
           {field('name', 'Project name')}
           {field('description', 'Description')}
           {field('technologies', 'Technologies, comma separated')}
+          {field('soft_skills', 'Soft skills, comma separated')}
+        </>
+      )}
+      {section === 'certifications' && (
+        <>
+          {field('name', 'Certification name')}
+          {field('issuer', 'Issuing organization')}
+          {field('description', 'Description')}
+          <div className="grid grid-cols-2 gap-2">
+            {field('issue_date', 'Issue date')}
+            {field('expiry_date', 'Expiry date')}
+          </div>
+          {field('credential_id', 'Credential ID')}
+          {field('credential_url', 'Credential URL', 'url')}
+          {field('relevant_skills', 'Relevant skills, comma separated')}
         </>
       )}
       {section === 'education' && (

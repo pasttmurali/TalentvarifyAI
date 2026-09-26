@@ -12,10 +12,17 @@ CATEGORY_MAX = {
 }
 
 SYSTEM_PROMPT = """You are an enterprise-grade AI Candidate Evaluation Engine.
+You evaluate every field of work: HR, recruiting, management, operations, sales, customer service, finance, healthcare,
+education, engineering, trades, technology, and others. Never assume a job is a software role. The technical_skills
+category is the existing schema name for role-specific hard/functional competencies in any occupation.
 Evaluate the candidate specifically against the supplied JOB DESCRIPTION; never give a generic CV or profile-completeness score.
 First classify job requirements as MANDATORY, IMPORTANT, PREFERRED, or OPTIONAL. Use all supplied profile evidence: technical and soft skills, detailed experience, projects, education, certifications, human languages, CV records, GitHub, portfolio, LinkedIn, and source metadata.
-Evidence confidence is separate from suitability. GitHub API/repository evidence and demonstrable portfolio evidence are strongest; detailed experience/projects are strong; CV-extracted claims are moderate; unsupported manual keywords are low. Never award points merely because an external API or URL is connected. API unavailable, not_verified, Plus tier required, or missing API fields must not automatically lower suitability; represent uncertainty in evidence_confidence. Do not double-count evidence.
-Use exactly these category maxima: technical_skills 30, relevant_experience 20, projects 15, github_evidence 10, education 8, soft_skills 7, languages 4, professional_alignment 3, certifications 3. Score job relevance, not quantity. If GitHub is irrelevant or unavailable, do not infer inability; explain uncertainty. The nine category scores must sum exactly to candidate_score and candidate_score must be 0..100.
+Evidence confidence is separate from suitability. Detailed experience, role-relevant outcomes, projects/initiatives/case studies,
+certifications, portfolio evidence, and verified sources can support any role. GitHub is strong evidence only for jobs where code
+or repositories are relevant. Never award points merely because an external URL is connected. API unavailable or missing API
+fields must not lower suitability. When GitHub is not relevant to the job, treat github_evidence as NOT_APPLICABLE and award
+its neutral maximum so a non-technical candidate is not penalized. Explain that it was not required. Do not double-count evidence.
+Use exactly these existing category maxima: technical_skills 30, relevant_experience 20, projects 15, github_evidence 10, education 8, soft_skills 7, languages 4, professional_alignment 3, certifications 3. Interpret projects as role-relevant projects, initiatives, campaigns, portfolios, or case studies. Score job relevance, not quantity. The nine category scores must sum exactly to candidate_score and candidate_score must be 0..100.
 Mandatory statuses are only PASS, FAIL, NOT_VERIFIED, MANUAL_REVIEW_REQUIRED, NOT_APPLICABLE. Missing information is NOT_VERIFIED, never automatically FAIL. Skill candidate_match is only STRONG_MATCH, MATCH, PARTIAL_MATCH, WEAK_MATCH, NO_EVIDENCE. Evidence strength is HIGH, MEDIUM, LOW, NONE.
 Never use or infer gender, race, ethnicity, religion, sexuality, disability, marital status, age, appearance, or national origin. Never fabricate facts.
 Return strict JSON only with: candidate_score, maximum_score=100, match_percentage, match_level, evidence_confidence, score_breakdown (all nine keys, each containing score,max,reason), mandatory_requirements, skill_analysis, strongest_matches, skill_gaps, experience_gaps, verification_gaps, candidate_strengths, concerns, recommendation {decision,reason}. Recommendation decision is one of HIGHLY_RECOMMENDED, RECOMMENDED, CONSIDER, MANUAL_REVIEW, NOT_RECOMMENDED."""
@@ -45,17 +52,35 @@ def _ratio(required, candidate):
 def _score(maximum, ratio): return round(max(0.0, min(float(maximum), maximum * ratio)), 1)
 
 
+SOFTWARE_EVIDENCE_TERMS = {
+    "developer", "software", "software engineer", "programmer", "programming", "data scientist", "machine learning",
+    "devops", "cloud", "cybersecurity", "frontend", "backend", "full stack", "mobile", "github", "git",
+    "python", "java", "javascript", "typescript", "react", "node", "api", "database", "sql",
+}
+SCORING_RULES_VERSION = "enterprise-standard-v3"
+
+
+def _github_is_relevant(job, required):
+    job_text = " ".join(str(job.get(key) or "") for key in ("title", "description", "skills")).casefold()
+    return any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", job_text) for term in SOFTWARE_EVIDENCE_TERMS)
+
+
 def deterministic_evaluation(job, candidate):
     required = [x.strip() for x in str(job.get("skills") or "").split(",") if x.strip()]
     skill_records = candidate.get("skills") or []
     tech = list(candidate.get("technical_skills") or []) + list(candidate.get("programming_languages") or []) + [
         str(x.get("skill")) for x in skill_records if isinstance(x, dict) and x.get("skill") and x.get("kind", "technical") != "soft"]
     soft = list(candidate.get("soft_skills") or []) + [str(x.get("skill")) for x in skill_records if isinstance(x, dict) and x.get("skill") and x.get("kind") == "soft"]
+    role_skills = [*tech, *soft, *[str(x.get("skill")) for x in skill_records if isinstance(x, dict) and x.get("skill")]]
     experiences, projects = candidate.get("experience") or [], candidate.get("projects") or []
     education, certifications = candidate.get("education") or [], candidate.get("certifications") or []
     languages = _names(candidate.get("human_languages") or candidate.get("languages"), "language", "name")
-    tech_ratio, matched = _ratio(required, tech)
-    project_ratio, project_matches = _ratio(required, [t for p in projects for t in p.get("technologies", [])])
+    role_ratio, matched = _ratio(required, role_skills)
+    project_evidence = [value for project in projects for value in [
+        project.get("name"), project.get("description"), project.get("candidate_contribution"),
+        *(project.get("technologies") or []), *(project.get("achievements") or []),
+    ] if value]
+    project_ratio, project_matches = _ratio(required, project_evidence)
     github = candidate.get("github") or candidate.get("github_profile") or {}
     github_ratio, github_matches = _ratio(required, github.get("detected_skills") or [])
     portfolio = candidate.get("portfolio_evidence") or {}
@@ -72,13 +97,21 @@ def deterministic_evaluation(job, candidate):
     alignment_words = set(re.findall(r"[a-z0-9+#.]+", f"{(candidate.get('personal_info') or {}).get('headline', '')} {candidate.get('professional_summary', '')}".casefold()))
     alignment_ratio = len(title_words & alignment_words) / max(1, len(title_words))
     cert_relevant = [c for c in certifications if any(term in str(c).casefold() for term in required + list(title_words))]
-    edu_text = " ".join(str(x) for x in education).casefold(); edu_relevance = 1.0 if education and any(x in edu_text for x in ("computer", "software", "engineering", "information technology")) else 0.5 if education else 0
+    edu_text = " ".join(str(x) for x in education).casefold()
+    education_terms = [*required, *title_words]
+    edu_relevance = 1.0 if education and any(str(x).casefold() in edu_text for x in education_terms) else 0.5 if education else 0
     github_available = github.get("verification_status") in {"verified", "success"}
+    github_relevant = _github_is_relevant(job, required)
     breakdown = {
-        "technical_skills": (_score(30, tech_ratio), f"Matched {len(matched)} of {len(required)} job technologies from candidate records."),
+        "technical_skills": (_score(30, role_ratio), f"Matched {len(matched)} of {len(required)} role competencies from candidate records."),
         "relevant_experience": (_score(20, exp_ratio), f"Evaluated {candidate_years:g} years and recorded work details against {required_years:g} required years."),
-        "projects": (_score(15, project_ratio), f"Project technologies support {len(project_matches)} job requirements."),
-        "github_evidence": (_score(10, github_ratio) if github_available else 0, "GitHub repository evidence supports relevant technologies." if github_matches else "No relevant verified GitHub evidence was available; this affects confidence, not other category marks."),
+        "projects": (_score(15, project_ratio), f"Projects, initiatives, or case studies support {len(project_matches)} job requirements."),
+        "github_evidence": (
+            _score(10, github_ratio) if github_relevant and github_available else 0 if github_relevant else 10,
+            "GitHub repository evidence supports relevant competencies." if github_matches
+            else "GitHub evidence was relevant but unavailable." if github_relevant
+            else "GitHub evidence is not applicable to this role and does not reduce suitability.",
+        ),
         "education": (_score(8, edu_relevance), "Education was evaluated for relevance to this job."),
         "soft_skills": (_score(7, soft_ratio), "Soft skills were credited only when relevant to the job description."),
         "languages": (_score(4, language_ratio), "Human-language evidence was evaluated only against communication requirements."),
@@ -105,7 +138,7 @@ def deterministic_evaluation(job, candidate):
     return {"candidate_score": total, "maximum_score": 100, "match_percentage": total, "match_level": level,
         "evidence_confidence": confidence, "score_breakdown": output_breakdown, "mandatory_requirements": mandatory, "skill_analysis": skill_analysis,
         "strongest_matches": sorted(matched)[:5], "skill_gaps": sorted(set(_terms(required)) - set(matched)), "experience_gaps": [],
-        "verification_gaps": ([] if github_available else ["GitHub evidence unavailable or unverified"]), "candidate_strengths": sorted(matched)[:5],
+        "verification_gaps": ([] if not github_relevant or github_available else ["GitHub evidence unavailable or unverified"]), "candidate_strengths": sorted(matched)[:5],
         "concerns": [], "recommendation": {"decision": "HIGHLY_RECOMMENDED" if total >= 90 else "RECOMMENDED" if total >= 75 else "CONSIDER" if total >= 55 else "MANUAL_REVIEW" if confidence < 60 else "NOT_RECOMMENDED", "reason": f"Job-specific evidence score is {total}/100 with {confidence}% evidence confidence."}}
 
 
@@ -134,11 +167,8 @@ def normalize_result(raw, fallback):
 
 
 async def evaluate(job: Dict[str, Any], candidate: Dict[str, Any], generate_json: Callable[[str], Awaitable[dict]] | None = None):
-    fallback = deterministic_evaluation(job, candidate)
-    if not generate_json: return fallback, "deterministic"
-    prompt = f"{SYSTEM_PROMPT}\n\nJOB DESCRIPTION:\n{json.dumps(job, default=str)}\n\nCANDIDATE PROFILE:\n{json.dumps(candidate, default=str)}"
-    try: return normalize_result(await generate_json(prompt), fallback), "gemini"
-    except Exception: return fallback, "deterministic_fallback"
+    """Return standardized marks; generative models never choose or alter numeric scores."""
+    return deterministic_evaluation(job, candidate), SCORING_RULES_VERSION
 
 
 def enterprise_scores(result):
