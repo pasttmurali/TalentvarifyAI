@@ -223,7 +223,10 @@ def startup_database():
 
 @app.get("/api/health")
 def health():
-    ensure_database()
+    try:
+        connect_database()
+    except PyMongoError as exc:
+        raise HTTPException(status_code=503, detail="MongoDB is unavailable. Check MONGODB_URI.") from exc
     return {
         "status": "ok",
         "database": "connected",
