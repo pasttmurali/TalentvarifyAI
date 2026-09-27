@@ -71,3 +71,15 @@ ReactDOM.createRoot(root).render(
   </React.StrictMode>,
 )
 
+// Keep the static splash visible while the initial JavaScript bundle mounts,
+// then fade it away without delaying access to the application.
+window.requestAnimationFrame(() => {
+  window.requestAnimationFrame(() => {
+    const splash = document.getElementById('app-splash')
+    if (!splash) return
+    splash.dataset.hidden = 'true'
+    splash.addEventListener('transitionend', () => splash.remove(), { once: true })
+    window.setTimeout(() => splash.remove(), 400)
+  })
+})
+
