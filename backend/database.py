@@ -6,6 +6,7 @@ This file handles connecting to the MongoDB database where all application data
 """
 
 import os
+import certifi
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
@@ -20,12 +21,18 @@ MONGODB_DB = os.getenv("MONGODB_DB", "talentverify")
 # - serverSelectionTimeoutMS=5000: If MongoDB isn't running, fail in 5 seconds instead of hanging
 # - appname="TalentVerifyAI": Identifies this application in MongoDB server logs
 # - tz_aware=True: Ensures all stored dates preserve UTC timezone accuracy
-mongo_client = MongoClient(
-    MONGODB_URI,
-    serverSelectionTimeoutMS=5000,
-    appname="TalentVerifyAI",
-    tz_aware=True,
-)
+mongo_options = {
+    "serverSelectionTimeoutMS": 5000,
+    "appname": "TalentVerifyAI",
+    "tz_aware": True,
+}
+
+# Atlas requires TLS. Use Certifi for this connection instead of globally
+# replacing Python's SSLContext, which can recurse on managed runtimes.
+if MONGODB_URI.casefold().startswith("mongodb+srv://"):
+    mongo_options["tlsCAFile"] = certifi.where()
+
+mongo_client = MongoClient(MONGODB_URI, **mongo_options)
 
 # STEP 4: Access the primary database instance ('talentverify')
 db = mongo_client[MONGODB_DB]

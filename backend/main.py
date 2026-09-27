@@ -6,7 +6,6 @@ from pydantic import BaseModel, ValidationError
 import os
 import sys
 import certifi
-import truststore
 import hashlib
 import secrets
 import uuid
@@ -17,11 +16,14 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from bson import ObjectId
 
+<<<<<<< HEAD
 # truststore's global SSL patch currently recurses inside Python 3.14 when
 # PyMongo constructs its TLS context. Render is pinned to Python 3.13, and
 # this guard also keeps startup safe if the runtime version is changed later.
 if sys.version_info < (3, 14):
     truststore.inject_into_ssl()
+=======
+>>>>>>> 20fc9b2 (Fix MongoDB TLS on Render)
 os.environ.setdefault("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", certifi.where())
 
 import json
