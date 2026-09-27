@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: talentverify-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: talentverify
+      - key: FRONTEND_URL
+        value: https://talentvarify-ai-theta.vercel.app
+      - key: CORS_ORIGINS
+        value: https://talentvarify-ai-theta.vercel.app
