@@ -4,7 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, ValidationError
 import os
-import sys
 import certifi
 import hashlib
 import secrets
@@ -16,14 +15,6 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from bson import ObjectId
 
-<<<<<<< HEAD
-# truststore's global SSL patch currently recurses inside Python 3.14 when
-# PyMongo constructs its TLS context. Render is pinned to Python 3.13, and
-# this guard also keeps startup safe if the runtime version is changed later.
-if sys.version_info < (3, 14):
-    truststore.inject_into_ssl()
-=======
->>>>>>> 20fc9b2 (Fix MongoDB TLS on Render)
 os.environ.setdefault("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", certifi.where())
 
 import json
@@ -1108,7 +1099,7 @@ def _normalize_cv_payload(payload):
     def normalize_url(value):
         if not value:
             return None
-        value = re.sub(r"\s+", "", str(value or "").strip()).rstrip(".,;:)>}\]\'\"")
+        value = re.sub(r"\s+", "", str(value or "").strip()).rstrip(".,;:)>}]'\"")
         if not value:
             return None
         if not re.match(r"^https?://", value, re.IGNORECASE):
